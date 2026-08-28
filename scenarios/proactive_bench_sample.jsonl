@@ -1,0 +1,8 @@
+{"timestamp":"2026-08-28T09:00:00Z","event_type":"coding","activity":"editor","app":"Code.exe","text":"editing attention.py","ground_truth":{"needed":false}}
+{"timestamp":"2026-08-28T09:02:00Z","event_type":"failure","activity":"terminal","app":"WindowsTerminal.exe","text":"pytest FAILED","ground_truth":{"needed":false}}
+{"timestamp":"2026-08-28T09:04:00Z","event_type":"failure","activity":"terminal","app":"WindowsTerminal.exe","text":"pytest FAILED","ground_truth":{"needed":false}}
+{"timestamp":"2026-08-28T09:05:00Z","event_type":"failure","activity":"terminal","app":"WindowsTerminal.exe","text":"pytest FAILED","ground_truth":{"needed":true}}
+{"timestamp":"2026-08-28T09:06:00Z","event_type":"documentation","activity":"research","app":"Chrome.exe","text":"reading cuda deterministic docs","ground_truth":{"needed":true,"timing_bad":false}}
+{"timestamp":"2026-08-28T09:09:00Z","event_type":"coding","activity":"editor","app":"Code.exe","text":"changing kv layout","ground_truth":{"needed":true,"timing_bad":false}}
+{"timestamp":"2026-08-28T09:11:00Z","event_type":"recovery","activity":"terminal","app":"WindowsTerminal.exe","text":"pytest passed","ground_truth":{"needed":true}}
+{"timestamp":"2026-08-28T09:15:00Z","event_type":"coding","activity":"editor","app":"Code.exe","text":"normal editing","ground_truth":{"needed":false,"timing_bad":true}}

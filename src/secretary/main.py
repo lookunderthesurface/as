@@ -128,6 +128,62 @@ def run_consolidate(config: SecretaryConfig | None = None, output=sys.stdout) ->
         store.close()
 
 
+def run_memory_doctor(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    """READ-ONLY memory hygiene diagnostics; never mutates."""
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        from .memory.doctor import diagnose
+
+        report = diagnose(store)
+        print("Ambient Secretary Memory Doctor", file=output)
+        print("\nSummary:", file=output)
+        print(f"  Core memory: {report.core_chars} chars / {report.core_budget} budget", file=output)
+        print(f"  Active memories: {report.active_memory_count}", file=output)
+        print(f"  Superseded rows retained: {report.superseded_count}", file=output)
+        findings = report.findings
+        if not findings:
+            print("\nNo findings.", file=output)
+        else:
+            print("\nFindings:", file=output)
+            for finding in findings:
+                print(f"- [{finding.severity}] {finding.kind}: {finding.message}", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def run_evaluate(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    """Labeled intervention evaluation. Counts always shown; rates only with ground truth."""
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        summary = store.intervention_label_summary()
+        from .evaluation.matrix import evaluate_labels
+
+        labels: list[str] = []
+        for episode in store.labeled_intervention_episodes(limit=500):
+            label = str(episode.get("user_label") or "").strip()
+            if label:
+                labels.append(label)
+        matrix = evaluate_labels(labels)
+        print("Ambient Secretary Intervention Evaluation", file=output)
+        print(f"\nLabeled opportunities: {summary['labeled_total']}", file=output)
+        for label in sorted(summary["labels"]):
+            print(f"  {label}: {summary['labels'][label]}", file=output)
+        print("\nMatrix (labels only; no fabricated ground truth):", file=output)
+        print(f"  TP: {matrix.tp}  FP: {matrix.fp}  TN: {matrix.tn}  FN: {matrix.fn}", file=output)
+        print(f"  Precision: {matrix.precision if matrix.precision is not None else 'n/a'}", file=output)
+        print(f"  Recall: {matrix.recall if matrix.recall is not None else 'n/a'}", file=output)
+        print(f"  False alarm rate: {matrix.false_alarm_rate if matrix.false_alarm_rate is not None else 'n/a (no TN ground truth)'}", file=output)
+        print(f"  Missed need rate: {matrix.missed_need_rate if matrix.missed_need_rate is not None else 'n/a'}", file=output)
+        if summary["unlabeled_total"]:
+            print(f"\n{summary['unlabeled_total']} unlabeled episodes; rates require human labels (or 'n/a' stays safe).", file=output)
+        return 0
+    finally:
+        store.close()
+
+
 def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
     config = config or SecretaryConfig.from_environment()
     store = MemoryStore(config.database_path)
@@ -776,6 +832,8 @@ def build_parser() -> argparse.ArgumentParser:
     label_parser.add_argument("--note", default="", help="optional short bounded note, no secrets")
     labels =     sub.add_parser("label-summary", help="show intervention label counts (evaluation-safe, no fabricated TP/FP)")
     sub.add_parser("consolidate", help="run one background memory consolidation (deferred, safe)")
+    sub.add_parser("memory-doctor", help="read-only memory hygiene diagnostics (dry run)")
+    sub.add_parser("evaluate", help="intervention evaluation from human labels (safe: no fabricated TP/FP)")
     interventions = sub.add_parser("recent-interventions", help="show recent bounded intervention episodes")
     interventions.add_argument("--limit", type=int, default=20)
     feedback = sub.add_parser("feedback", help="record explicit feedback for an intervention episode")
@@ -821,6 +879,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(run_label_summary(config))
     if args.command == "consolidate":
         raise SystemExit(run_consolidate(config))
+    if args.command == "memory-doctor":
+        raise SystemExit(run_memory_doctor(config))
+    if args.command == "evaluate":
+        raise SystemExit(run_evaluate(config))
     if args.command == "feedback":
         if args.episode_option is not None and (args.value_arg is not None or (args.value_option is not None and args.episode_id_arg is not None)):
             parser.error("feedback accepts one episode id and one value; do not mix duplicate positional and option values")
