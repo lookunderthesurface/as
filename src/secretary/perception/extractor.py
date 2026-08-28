@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..events.schema import NormalizedEvent
+from ..events.schema import NormalizedEvent, sanitize_failure_signature
 from ..inference.base import InferenceProvider
 from ..inference.mock import MockInferenceProvider
 from ..inference.schema import Action, InferenceRequest, InferenceResult, validate_inference_result
@@ -53,7 +53,7 @@ class EventExtractor:
             importance=event_result.importance,
             novelty=event_result.novelty,
             confidence=event_result.confidence,
-            failure_signature=event_result.failure_signature,
+            failure_signature=sanitize_failure_signature(event_result.failure_signature),
             topic=event_result.topic,
             candidate_action=result.secretary.candidate_action,
             interrupt_score=result.secretary.interrupt_score,

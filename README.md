@@ -6,7 +6,8 @@ configured local provider (`MockInferenceProvider` by default or the explicit
 Ollama qwen3-vl provider), maintains bounded working state, remembers important
 events in real SQLite, watches repeated failures, and interrupts only after
 deterministic evidence, model candidate thresholds, and hard notification gates
-agree.
+agree. Meaningful intervention opportunities are recorded separately so explicit
+user feedback can shape future intervention timing without bypassing those gates.
 
 The default configuration deliberately does not automate the computer, record
 audio, call a real LLM, send screenshots to the cloud, or install system services.
@@ -14,7 +15,7 @@ An explicit Ollama provider/smoke command is available for local-only testing.
 
 ## Quick start
 
-From `C:\Users\huwencan\workspace\0828`:
+From the repository root:
 
 ```powershell
 python -m venv .venv
@@ -78,6 +79,14 @@ $env:INFERENCE_PROVIDER = "ollama"
 .\.venv\Scripts\python.exe -m secretary session-report
 .\.venv\Scripts\python.exe -m secretary recent-decisions --limit 20
 .\.venv\Scripts\python.exe -m secretary recent-decisions --action WOULD_NOTIFY --suppressed
+
+# Inspect bounded intervention opportunities and learned preferences
+.\.venv\Scripts\python.exe -m secretary recent-interventions --limit 20
+.\.venv\Scripts\python.exe -m secretary feedback <episode-id> useful
+.\.venv\Scripts\python.exe -m secretary feedback <episode-id> dont-remind
+.\.venv\Scripts\python.exe -m secretary feedback <episode-id> more-proactive
+.\.venv\Scripts\python.exe -m secretary feedback <episode-id> timing-bad
+.\.venv\Scripts\python.exe -m secretary profile
 
 # Run the ten privacy-safe deterministic CPU scenarios
 .\.venv\Scripts\python.exe -m secretary benchmark
@@ -147,7 +156,7 @@ the unit, replay, or default mock runtime paths.
 
 Stop a foreground run with `Ctrl+C`; the process finally block closes only a
 Secretary-owned Screenpipe child. To remove the project, stop any run and delete
-this `0828` directory; no system service, scheduled task, registry key, or global
+the repository directory; no system service, scheduled task, registry key, or global
 package is created by the project. The optional package cache entry mentioned in
 [EXTERNAL_CHANGES.md](EXTERNAL_CHANGES.md) can be removed separately if desired.
 
@@ -184,12 +193,39 @@ package is created by the project. The optional package cache entry mentioned in
 - `session-report` and `recent-decisions` expose only bounded metadata (app,
   event type, candidate/final action, scores, evidence, suppression, and latency).
   They do not print full OCR, prompts, screenshots, passwords, or tokens.
+- Meaningful intervention opportunities are stored separately from ordinary
+  activity. `InterventionEpisode` records bounded decision context, notification
+  delivery, WATCH outcome, and user reaction. Explicit feedback creates an
+  explainable, scoped preference that can be superseded or forgotten; it never
+  bypasses privacy, pause, stale-result, rate-limit, or hard notification rules.
+- `recent-interventions` and `profile` expose only bounded semantic summaries.
+  `feedback` accepts `useful`, `dont-remind`, `more-proactive`, `timing-bad`,
+  observed reaction/outcome fields, and `forget`; no raw screen content is needed.
 - SQLite is stored under `%LOCALAPPDATA%\AmbientSecretary` for normal installed
   runs, or under the source checkout's `data\` and `logs\` in an explicit project
   configuration. `SECRETARY_DATA_DIR`, `SECRETARY_DB_PATH`, and
   `SECRETARY_LOG_DIR` make the locations explicit. The schema is versioned,
-  previous active sessions are marked `ABORTED` after a crash, and bounded
-  decision/session retention never deletes semantic memories.
+  sessions left active by a dead process are marked `ABORTED` on the next start,
+  and bounded decision/session retention never deletes semantic memories.
+- Failure signatures that look untrusted and any credential-shaped semantic
+  label (`*_secret=`, `*_token=`, `Bearer`, `sk-`, PEM keys) are redacted
+  before persistence, and applying this convention to a reopened database
+  normalizes its existing rows.
+- GUI perception is *adaptive* rather than per-frame: a deterministic
+  `VisualKeyframeScheduler` classifies each accepted frame as `SAME`,
+  `STRUCTURED` (text-level update, no VLM), or `VISUAL` (full VLM perception).
+  Only `VISUAL` frames open a screenshot; the VLM receives the image plus
+  Screenpipe OCR/UIA grounding and the previous `SemanticGUIState`, so it
+  compares rather than re-describes. A failed perception never blocks the
+  event pipeline and never persists a screenshot path.
+- Compressed semantic understanding is kept in `gui_states` and
+  `gui_trajectory_events`; raw screenshots are never stored in SQLite.
+  `current-state` shows the latest sanitized GUI state (application,
+  activity, progress, errors), and `trajectory --last MINUTES` shows the
+  merged semantic narrative. Excluded apps are blocked before perception,
+  which is also asserted as defense in depth in `VisualCognition`. All
+  synthetic GUI fixtures under `tests/fixtures/gui/` are generated safe
+  images with no real screen content.
 
 ## Tests
 

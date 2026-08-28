@@ -34,6 +34,9 @@ class InferenceContextBuilder:
         created_at: datetime | None = None,
         activity_snapshot: tuple[str, ...] | None = None,
         topic_snapshot: str | None = None,
+        gui_state_text: str = "",
+        gui_trajectory_text: str = "",
+        gui_state: Mapping[str, object] | None = None,
     ) -> InferenceRequest:
         vision = self.vision_gate.allow(current_event) if use_vision is None else bool(use_vision)
         recent_events_tuple = tuple(recent_events)
@@ -47,6 +50,8 @@ class InferenceContextBuilder:
             active_hypotheses=hypotheses_tuple,
             recent_failures=failures_tuple,
             recent_assistant_decisions=decisions_tuple,
+            gui_state_text=gui_state_text,
+            gui_trajectory_text=gui_trajectory_text,
         )
         return InferenceRequest(
             current_event=current_event,
@@ -63,6 +68,9 @@ class InferenceContextBuilder:
             created_at=created_at or datetime.now(timezone.utc),
             activity_snapshot=activity_snapshot or (current_event.foreground_app, current_event.event_source, current_event.window_title),
             topic_snapshot=topic_snapshot,
+            gui_state_text=gui_state_text,
+            gui_trajectory_text=gui_trajectory_text,
+            gui_state=gui_state,
             context_chars=len(text),
             context_event_count=len(recent_events_tuple),
             context_watch_count=len(hypotheses_tuple),
@@ -77,12 +85,16 @@ class InferenceContextBuilder:
         active_hypotheses: tuple[Mapping[str, object], ...],
         recent_failures: tuple[str, ...],
         recent_assistant_decisions: tuple[str, ...],
+        gui_state_text: str = "",
+        gui_trajectory_text: str = "",
     ) -> str:
         current_text_budget = max(120, min(2000, self.max_text_chars // 3))
         sections = [
             "CURRENT EVENT\n" + self._current_line(current_event, current_text_budget),
+            "CURRENT GUI STATE\n" + (gui_state_text or "none"),
             "CURRENT OBJECTIVE\n" + self._text(working_state.get("current_objective"), "none"),
             "CURRENT SUBGOAL\n" + self._text(working_state.get("current_subgoal"), "none"),
+            "SEMANTIC TRAJECTORY\n" + (gui_trajectory_text or "none"),
             "ACTIVE WATCH HYPOTHESIS\n" + self._render_mappings(active_hypotheses, "none"),
             "RECENT FAILURES\n" + self._render_values(recent_failures, "none"),
             "RECENT TRAJECTORY\n" + self._render_events(recent_events, "none"),
@@ -93,8 +105,10 @@ class InferenceContextBuilder:
         result = sections[0]
         for section in sections[1:5]:
             result = self._append(result, section)
-        trajectory = sections[5]
-        decisions = sections[6]
+        trajectory = sections[7]
+        decisions = sections[8]
+        result = self._append(result, sections[5])
+        result = self._append(result, sections[6])
         result = self._append(result, trajectory)
         result = self._append(result, decisions)
         return result[: self.max_text_chars]

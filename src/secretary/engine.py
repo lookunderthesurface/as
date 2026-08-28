@@ -27,12 +27,18 @@ from .inference.scheduler import InferenceScheduler
 from .inference.schema import InferenceRequest
 from .inference.stale import ResultFreshness, assess_result
 from .inference.status import InferenceRuntimeState, LocalInferenceStatus
+from .memory.intervention import classify_situation
+from .memory.retrieval import retrieve_relevant_intervention_preferences, retrieve_similar_intervention_episodes
 from .perception.extractor import ExtractedEvent, EventExtractor
 from .policy.hard_rules import HardRules
 from .policy.proactive import Action, Decision, PolicyThresholds, ProactivePolicy
 from .policy.watch import WatchManager
 from .privacy.filter import PrivacyFilter
 from .runtime import RuntimeCounters
+from .vision.cognition import VisualCognition
+from .vision.mock_gui import MockGUIPerceptionProvider
+from .vision.ollama_gui import GUIPerceptionOllamaProvider
+from .vision.world import DesktopWorldState
 
 
 @dataclass
@@ -111,6 +117,7 @@ class SecretaryEngine:
             stale_request_seconds=self.config.inference_stale_request_seconds,
         )
         self.extractor = EventExtractor(self.inference)
+        self.cognition = self._build_visual_cognition()
         self.watch = WatchManager(self.config.watch_expiration_minutes, self.config.watch_max_active_hypotheses)
         self.hard_rules = HardRules(
             self.config.max_notifications_per_hour,
@@ -140,6 +147,7 @@ class SecretaryEngine:
         if self._closed:
             return
         self._closed = True
+        self._persist_gui_trajectory()
         self.store.end_session(self.session_id, {"counters": self.counters.snapshot()})
         self.store.close()
         close_logger(self.logger)
@@ -156,6 +164,14 @@ class SecretaryEngine:
             return status()
         return LocalInferenceStatus(provider=self.config.inference_provider, status=InferenceRuntimeState.DEGRADED)
 
+    def _build_visual_cognition(self) -> VisualCognition:
+        """Wire GUI perception to the provider; mock stays deterministically offline."""
+        if self.config.inference_provider == "ollama" and isinstance(self.inference, OllamaInferenceProvider):
+            perception = GUIPerceptionOllamaProvider(self.inference)
+        else:
+            perception = MockGUIPerceptionProvider()
+        return VisualCognition(perception, world=DesktopWorldState(), excluded_apps=self.config.excluded_apps)
+
     def process(self, raw: dict[str, object]) -> ProcessResult:
         if self.session.paused:
             decision = Decision(Action.IGNORE, "paused", reason_code="PAUSED")
@@ -171,6 +187,7 @@ class SecretaryEngine:
             self.counters.increment("duplicate_events_dropped")
             return ProcessResult(Decision(Action.IGNORE, "duplicate capture frame", reason_code="DUPLICATE_DROPPED"))
         self.coalescer.add(event)
+        gui_state_text, gui_trajectory_text = self._observe_gui_state(event)
         request = self.context_builder.build(
             event,
             recent_events=self.coalescer.snapshot(),
@@ -181,6 +198,8 @@ class SecretaryEngine:
             image_path=event.image_path,
             generation_id=self._generation_value(),
             topic_snapshot=self.state.current_topic or self.state.current_objective,
+            gui_state_text=gui_state_text,
+            gui_trajectory_text=gui_trajectory_text,
         )
         extracted = self.extractor.extract(event, request)
         if request.use_vision:
@@ -235,6 +254,7 @@ class SecretaryEngine:
             return results, None
         self.counters.increment("coalesced_batches")
         event = accepted[-1]
+        gui_state_text, gui_trajectory_text = self._observe_gui_state(event)
         request = self.context_builder.build(
             event,
             recent_events=self.coalescer.snapshot(),
@@ -245,6 +265,8 @@ class SecretaryEngine:
             image_path=event.image_path,
             generation_id=self._generation_value(),
             topic_snapshot=self.state.current_topic or self.state.current_objective,
+            gui_state_text=gui_state_text,
+            gui_trajectory_text=gui_trajectory_text,
         )
         return results, InferenceWork(event=event, request=request)
 
@@ -347,6 +369,97 @@ class SecretaryEngine:
         if result.error_type in {"malformed_response", "malformed_result", "structured_output_failure"}:
             self.counters.increment("structured_output_failures")
 
+    def _observe_gui_state(self, event: NormalizedEvent) -> tuple[str, str]:
+        """Spend pixels only when the keyframe gate asks; fold into world state.
+
+        Returns bounded prompt text (current GUI state + semantic trajectory)
+        for the inference request. Never receives an excluded-app event.
+        """
+        update = self.cognition.on_accepted_event(event, event.timestamp, skip_vision=not event.image_path)
+        if update.is_same:
+            return self._gui_prompt_texts()
+        if update.perception_failed:
+            self.counters.increment("visual_perception_failures")
+            self.counters.increment("visual_perception_calls")
+            return self._gui_prompt_texts()
+        if update.used_vision:
+            self.counters.increment("visual_keyframes")
+            self.counters.increment("visual_perception_calls")
+        else:
+            self.counters.increment("structured_gui_updates")
+        self._persist_gui_update(update, event)
+        return self._gui_prompt_texts()
+
+    def _gui_prompt_texts(self) -> tuple[str, str]:
+        state = self.cognition.current_gui_state
+        if state is None:
+            return "", ""
+        state_text = (
+            f"app={state.application}; window={state.window}; activity={state.activity}; "
+            f"topic={state.topic or 'none'}; progress={state.progress}"
+            + (f"; errors={len(state.errors)}" if state.errors else "")
+        )
+        return state_text, self.cognition.recent_trajectory_text()
+
+    def _persist_gui_update(self, update, event: NormalizedEvent) -> None:
+        state = update.state
+        if state is None:
+            return
+        delta = self.cognition.world.last_delta
+        changed = delta.changed_fields if delta is not None else ()
+        trajectory_label = ""
+        trajectory = self.cognition.world.trajectory.snapshot()
+        if trajectory:
+            trajectory_label = trajectory[-1].label
+        try:
+            self.store.record_gui_state(
+                session_id=self.session_id,
+                event_timestamp=event.timestamp,
+                application=state.application,
+                window=state.window,
+                activity=state.activity,
+                topic=state.topic,
+                progress=state.progress,
+                task_hint=state.task_hint,
+                errors=state.errors,
+                confidence=state.confidence,
+                perception_mode="vision" if update.used_vision else "structured",
+                keyframe_reason=update.decision.reason if update.decision else "unknown",
+                changed_fields=changed,
+                recovery=bool(delta is not None and delta.recovery),
+                regression=bool(delta is not None and delta.regression),
+                trajectory_label=trajectory_label,
+                generation_id=self._generation_value(),
+            )
+            self.counters.increment("gui_states_recorded")
+            if delta is not None and delta.recovery:
+                self.counters.increment("gui_recoveries")
+            if delta is not None and delta.regression:
+                self.counters.increment("gui_regressions")
+        except Exception:
+            self.logger.warning("event_type=gui_state_persist_error error_class=sqlite")
+
+    def _persist_gui_trajectory(self) -> None:
+        """Persist the accumulated semantic trajectory once (bounded session write).
+
+        The unique index on (session_id, event_timestamp, label) makes the
+        write idempotent across restarts that re-close the same session.
+        """
+        try:
+            for event in self.cognition.world.trajectory.snapshot()[-60:]:
+                if self.store.record_gui_trajectory_event(
+                    session_id=self.session_id,
+                    event_timestamp=event.timestamp,
+                    label=event.label,
+                    activity=event.activity,
+                    application=event.application,
+                    topic=event.topic,
+                    importance=event.importance,
+                ):
+                    self.counters.increment("gui_trajectory_events_recorded")
+        except Exception:
+            self.logger.warning("event_type=gui_trajectory_persist_error error_class=sqlite")
+
     def _discard_stale_result(
         self,
         event: NormalizedEvent,
@@ -407,6 +520,7 @@ class SecretaryEngine:
         final_action: str,
         request: InferenceRequest | None,
         reason_code: str,
+        intervention_episode_id: int | None = None,
     ) -> None:
         result = self.extractor.last_result
         metrics = result.metrics if result is not None else None
@@ -434,6 +548,10 @@ class SecretaryEngine:
             context_chars=request.context_chars if request is not None else 0,
             context_event_count=request.context_event_count if request is not None else 0,
             context_watch_count=request.context_watch_count if request is not None else 0,
+            preference_ids=decision.preference_ids,
+            preference_effect=decision.preference_effect,
+            similar_episode_ids=decision.similar_episode_ids,
+            intervention_episode_id=intervention_episode_id,
         )
 
     def _apply_extracted(
@@ -448,22 +566,36 @@ class SecretaryEngine:
         self.state.observe(extracted)
         resolved_at = self.watch.resolved_at(extracted.failure_signature) if extracted.failure_signature else None
         failure_count = self.store.count_failures(extracted.failure_signature, since=resolved_at) if extracted.failure_signature else 0
-        decision = self.policy.decide(extracted, self.state, failure_count + (1 if extracted.failure_signature else 0), event.timestamp)
+        preferences = retrieve_relevant_intervention_preferences(self.store, extracted)
+        similar_episodes = retrieve_similar_intervention_episodes(self.store, extracted)
+        if preferences:
+            self.counters.increment("preference_matches")
+        decision = self.policy.decide(
+            extracted,
+            self.state,
+            failure_count + (1 if extracted.failure_signature else 0),
+            event.timestamp,
+            preferences=preferences,
+            similar_episodes=similar_episodes,
+        )
+        transitions = self.watch.peek_transitions()
         self.store.record_event(extracted, source=event.source, session_id=self.session_id)
-        final_action = decision.action.value
         if decision.action.value.casefold() in {"ignore", "remember", "watch", "investigate"}:
             self.counters.increment(f"policy_{decision.action.value.casefold()}")
         if decision.candidate_action == Action.NOTIFY:
             self.counters.increment("policy_notify_candidate")
         if decision.candidate_action == Action.ASK_CLOUD:
             self.counters.increment("policy_ask_cloud")
+        final_action = decision.action.value
         self.state.add_decision(final_action)
         if decision.action == Action.REMEMBER:
             self.store.record_memory(extracted.summary, importance=extracted.importance, tags=extracted.failure_signature or "")
+        self.state.set_hypotheses(self.watch.snapshot())
         if self.watch.active:
-            self.state.set_hypotheses(self.watch.snapshot())
             active = self.watch.active
             self.store.record_hypothesis(active.hypothesis, active.evidence, "watching", active.expires_at.isoformat())
+        was_notified = False
+        notification_id: int | None = None
         if decision.action == Action.NOTIFY:
             title = decision.notification_title or "Ambient Secretary"
             body = decision.notification_body or decision.reason
@@ -473,12 +605,64 @@ class SecretaryEngine:
                 if not shadow_notification:
                     self.hard_rules.mark_notified(extracted, event.timestamp)
                     self.counters.increment("real_notify")
+                    was_notified = True
                 else:
                     final_action = "WOULD_NOTIFY"
                     self.counters.increment("would_notify")
-                self.store.record_notification(title, body, final_action)
+                notification_id = self.store.record_notification(title, body, final_action)
             except Exception as exc:
                 self.logger.warning("event_type=notification_error error_class=%s", exc.__class__.__name__)
+
+        intervention_episode_id: int | None = None
+        if self._is_intervention_opportunity(extracted, decision):
+            transition = next((item for item in transitions if item.get("watch_id") == decision.watch_id), None)
+            watch_status = str(transition.get("status")) if transition else ("ACTIVE" if decision.watch_id else "RECORDED")
+            watch_context = {
+                "watch_id": decision.watch_id,
+                "evidence": decision.watch_evidence,
+                "status": watch_status,
+            }
+            reason_codes = [decision.reason_code]
+            if decision.preference_effect:
+                reason_codes.append(decision.preference_effect)
+            intervention_episode_id = self.store.record_intervention_episode(
+                session_id=self.session_id,
+                event_timestamp=event.timestamp,
+                situation_type=classify_situation(extracted.event_type, extracted.activity, extracted.failure_signature),
+                activity=extracted.activity,
+                event_type=extracted.event_type,
+                topic=extracted.topic,
+                failure_signature=extracted.failure_signature,
+                summary=extracted.summary,
+                watch_id=decision.watch_id,
+                watch_context=watch_context,
+                candidate_action=decision.candidate_action.value,
+                final_action=final_action,
+                reason_codes=reason_codes,
+                model_confidence=decision.candidate_confidence,
+                importance=decision.candidate_importance,
+                interrupt_score=decision.interrupt_score,
+                was_notified=was_notified,
+                status=watch_status,
+                outcome=str(transition.get("outcome") or "UNKNOWN") if transition else "UNKNOWN",
+                notification_id=notification_id,
+                preference_ids=decision.preference_ids,
+            )
+            self.counters.increment("intervention_episodes_recorded")
+        for transition in transitions:
+            watch_id = transition.get("watch_id")
+            if watch_id:
+                transition_status = str(transition.get("status") or "")
+                if transition_status == "RESOLVED":
+                    self.counters.increment("watch_resolved")
+                elif transition_status == "EXPIRED":
+                    self.counters.increment("watch_expired")
+                self.store.update_intervention_outcome(
+                    str(watch_id),
+                    str(transition.get("status") or "ACTIVE"),
+                    str(transition.get("outcome") or "UNKNOWN"),
+                )
+        self.watch.acknowledge_transitions(transitions)
         self.store.record_decision(decision.action.value, decision.reason, decision.evidence)
         inference_result = self.extractor.last_result
         metrics = inference_result.metrics if inference_result is not None else None
@@ -526,8 +710,22 @@ class SecretaryEngine:
             context_chars=request.context_chars if request is not None else 0,
             context_event_count=request.context_event_count if request is not None else 0,
             context_watch_count=request.context_watch_count if request is not None else 0,
+            preference_ids=decision.preference_ids,
+            preference_effect=decision.preference_effect,
+            similar_episode_ids=decision.similar_episode_ids,
+            intervention_episode_id=intervention_episode_id,
         )
         return ProcessResult(decision, extracted)
+
+    @staticmethod
+    def _is_intervention_opportunity(event: ExtractedEvent, decision: Decision) -> bool:
+        """Avoid turning ordinary desktop activity into unbounded episode memory."""
+        return bool(
+            event.event_type in {"failure", "recovery", "success"}
+            or event.candidate_action != Action.IGNORE
+            or decision.action != Action.IGNORE
+            or decision.reason_code.startswith("WATCH_")
+        )
 
     def process_capture(self, provider: ScreenpipeCaptureProvider) -> list[ProcessResult]:
         return self.process_coalesced([dict(item) for item in provider.poll()])

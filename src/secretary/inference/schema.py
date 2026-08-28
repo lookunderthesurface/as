@@ -43,6 +43,9 @@ class InferenceRequest:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     activity_snapshot: tuple[str, ...] = ()
     topic_snapshot: str | None = None
+    gui_state_text: str = ""
+    gui_trajectory_text: str = ""
+    gui_state: Mapping[str, object] | None = None
     context_chars: int = 0
     context_event_count: int = 0
     context_watch_count: int = 0

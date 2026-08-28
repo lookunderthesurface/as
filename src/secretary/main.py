@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import platform
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -23,12 +24,23 @@ from .inference.ollama import OllamaInferenceProvider
 from .inference.schema import InferenceRequest
 from .inference.status import InferenceRuntimeState, LocalInferenceStatus
 from .instance import InstanceLock
+from .memory.intervention import parse_outcome, parse_reaction
+from .memory.profile import build_secretary_profile
 from .memory.store import MemoryStore
 from .notifications.mock import MockNotificationProvider
 from .notifications.shadow import ShadowNotificationProvider
 from .notifications.windows import WindowsNotificationProvider
 from .platform.windows.job_object import WindowsJobObject
 from .ui.tray import TrayApplication, TrayUnavailable
+
+
+class _StoreOnce(argparse.Action):
+    """Reject duplicate option values instead of silently keeping the last one."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            raise argparse.ArgumentError(self, f"{option_string or self.dest} may only be specified once")
+        setattr(namespace, self.dest, values)
 
 
 def _scenario_items(path: Path) -> list[dict[str, object]]:
@@ -98,6 +110,17 @@ def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout)
         _print_action_counts(report["final_actions"], output)
         print(f"\nSuppressed model NOTIFY: {report['suppressed_model_notify']}", file=output)
         print(f"Cloud escalation candidates (Mock only): {report['cloud_escalation_candidates']}", file=output)
+        custom_metrics = store.gui_perception_stats()
+        print(f"Intervention episodes: {report['intervention_episodes']}", file=output)
+        print(f"Personalized decisions: {report['personalized_decisions']}", file=output)
+        print("\nVisual perception:", file=output)
+        print(f"GUI states recorded: {custom_metrics['gui_states']}", file=output)
+        print(f"Vision VLM calls: {custom_metrics['vision_perceptions']}", file=output)
+        print(f"Structured-only updates: {custom_metrics['structured_updates']}", file=output)
+        print(f"GUI recoveries: {custom_metrics['recoveries']}  regressions: {custom_metrics['regressions']}", file=output)
+        latency = custom_metrics["latency"]
+        if latency.get("count"):
+            print(f"Perception latency: median={latency['median_ms']:.1f}ms p90={latency['p90_ms']:.1f}ms p95={latency['p95_ms']:.1f}ms max={latency['max_ms']:.1f}ms", file=output)
         if report["suppression_reasons"]:
             print("Reasons:", file=output)
             for reason, count in sorted(report["suppression_reasons"].items()):
@@ -115,6 +138,7 @@ def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout)
                 "inference_replaced", "inference_results_received", "inference_results_stale_discarded",
                 "policy_ignore", "policy_remember", "policy_watch", "policy_investigate",
                 "policy_notify_candidate", "policy_ask_cloud", "would_notify", "real_notify",
+                "intervention_episodes_recorded", "preference_matches", "watch_resolved", "watch_expired",
             ):
                 if counters.get(name, 0):
                     print(f"{name}: {counters[name]}", file=output)
@@ -154,9 +178,177 @@ def run_recent_decisions(config: SecretaryConfig | None = None, limit: int = 20,
             print(f"deterministic_evidence={trace['deterministic_evidence']} watch_evidence={trace['watch_evidence']}", file=output)
             if trace["suppression_reason"]:
                 print(f"suppression={trace['suppression_reason']}", file=output)
+            if trace.get("preference_effect"):
+                print(f"preference_effect={trace['preference_effect']}", file=output)
+            if trace.get("intervention_episode_id"):
+                print(f"intervention_episode=#{trace['intervention_episode_id']}", file=output)
         return 0
     finally:
         store.close()
+
+
+def run_recent_interventions(config: SecretaryConfig | None = None, limit: int = 20, output=sys.stdout) -> int:
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        episodes = list(reversed(store.recent_intervention_episodes(limit)))
+        print("Ambient Secretary Intervention Episodes", file=output)
+        if not episodes:
+            print("\nNo intervention episodes recorded.", file=output)
+            return 0
+        for episode in episodes:
+            timestamp = str(episode.get("event_timestamp") or "").replace("T", " ")[:19]
+            print(f"\n#{episode['id']} {timestamp}", file=output)
+            print(f"Situation: {episode['situation_type']} / {episode['activity']}", file=output)
+            print(f"Event: {episode['event_type']}", file=output)
+            print(f"Final: {episode['final_action']}  status={episode['status']} outcome={episode['outcome']}", file=output)
+            print(f"Notified: {'yes' if episode['was_notified'] else 'no'}  reaction={episode['user_reaction']}", file=output)
+            reason_codes = episode.get("reason_codes") or []
+            if reason_codes:
+                print(f"Reasons: {', '.join(str(code) for code in reason_codes)}", file=output)
+            if episode.get("explicit_feedback"):
+                feedback_label = str(episode["explicit_feedback"]).split(":", 1)[0]
+                if feedback_label not in {"USEFUL", "MORE_PROACTIVE", "DONT_REMIND", "TIMING_BAD", "FORGET"}:
+                    feedback_label = "USER_NOTE_RECORDED"
+                print(f"Feedback: {feedback_label}", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def run_feedback(
+    config: SecretaryConfig | None = None,
+    episode_id: int | None = None,
+    value: str | None = None,
+    output=sys.stdout,
+    *,
+    reaction: str | None = None,
+    outcome: str | None = None,
+    note: str = "",
+) -> int:
+    if episode_id is None:
+        print("Feedback requires an intervention episode id.", file=output)
+        return 2
+    if value is None or not value.strip():
+        value = "OBSERVED" if reaction or outcome else None
+    if value is None:
+        print("Feedback requires a value such as useful, dont-remind, more-proactive, or timing-bad.", file=output)
+        return 2
+    config = config or SecretaryConfig.from_environment()
+    store: MemoryStore | None = None
+    try:
+        store = MemoryStore(config.database_path)
+        # Validate CLI values before mutating the database and keep the accepted
+        # vocabulary visible to callers using this function as an internal API.
+        if reaction is not None:
+            parse_reaction(reaction)
+        if outcome is not None:
+            parse_outcome(outcome)
+        result = store.record_intervention_feedback(
+            int(episode_id),
+            value,
+            reaction=reaction,
+            outcome=outcome,
+            note=note,
+        )
+        print(f"Recorded feedback for episode #{result['episode_id']}: {result['value']}", file=output)
+        if result["preference_id"] is not None:
+            print(f"Active preference #{result['preference_id']} updated.", file=output)
+        return 0
+    except (ValueError, OverflowError, sqlite3.Error) as exc:
+        print(f"Feedback not recorded: {exc}", file=output)
+        return 2
+    finally:
+        if store is not None:
+            store.close()
+
+
+def run_secretary_profile(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        profile = build_secretary_profile(store.active_intervention_preferences(limit=200))
+        print("Ambient Secretary Profile", file=output)
+        print(f"\nGeneral: {profile.general}", file=output)
+        print(f"Learned rules: {profile.source_count}", file=output)
+        for rule in profile.rules:
+            print(f"- {rule}", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def run_current_state(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        state = store.latest_gui_state()
+        print("Ambient Secretary Current Visual State", file=output)
+        if state is None:
+            print("\nNo visual state recorded yet.", file=output)
+            return 0
+        print(f"\nApplication: {state['application']}", file=output)
+        print(f"Window: {state['window'] or '(none)'}", file=output)
+        print(f"Activity: {state['activity']}", file=output)
+        print(f"Topic: {state['topic'] or '(none)'}", file=output)
+        print(f"Task: {state['task_hint'] or '(none)'}", file=output)
+        print(f"Progress: {state['progress']}  confidence={float(state['confidence']):.2f}", file=output)
+        errors = state.get("errors") or []
+        if errors:
+            print(f"Errors: {len(errors)}", file=output)
+            for error in errors[:3]:
+                print(f"- {error}", file=output)
+        if state.get("delta_recovery"):
+            print("Recovery: yes", file=output)
+        trajectory = store.recent_trajectory_events(limit=20)
+        if trajectory:
+            print("\nRecent trajectory:", file=output)
+            for item in trajectory[-10:]:
+                timestamp = str(item["event_timestamp"]).replace("T", " ")[:16]
+                print(f"{timestamp}  {item['label']}", file=output)
+        watch = store.recent_gui_states(limit=6)
+        if watch:
+            print("\nLast transitions:", file=output)
+            for item in watch:
+                timestamp = str(item["event_timestamp"]).replace("T", " ")[:16]
+                fields = ", ".join(item.get("changed_fields") or [])
+                print(f"{timestamp}  [{item['perception_mode']}] {fields or 'no significant change'}", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def run_gui_trajectory(config: SecretaryConfig | None = None, minutes: int = 20, output=sys.stdout, *, limit: int = 100) -> int:
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        events = store.recent_trajectory_events(limit=max(1, min(500, limit)))
+        cutoff = datetime.now(timezone.utc).timestamp() - max(1, minutes) * 60
+        eligible = [item for item in events if _parse_db_timestamp(item["event_timestamp"]) >= cutoff]
+        print("Ambient Secretary Semantic Trajectory", file=output)
+        if not eligible:
+            print(f"\nNo semantic trajectory recorded in the last {minutes} minute(s).", file=output)
+            return 0
+        for item in eligible:
+            timestamp = str(item["event_timestamp"]).replace("T", " ")[:16]
+            topic = f" ({item['topic']})" if item.get("topic") else ""
+            print(f"{timestamp}  {item['label']}{topic}", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def _parse_db_timestamp(value: object) -> float:
+    from datetime import datetime as _dt
+
+    text = str(value).replace("Z", "+00:00")
+    try:
+        parsed = _dt.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _command_has_version(command: tuple[str, ...], version: str) -> bool:
@@ -478,12 +670,28 @@ def build_parser() -> argparse.ArgumentParser:
     recent.add_argument("--limit", type=int, default=20)
     recent.add_argument("--action", choices=("IGNORE", "REMEMBER", "WATCH", "INVESTIGATE", "ASK_CLOUD", "NOTIFY", "WOULD_NOTIFY"))
     recent.add_argument("--suppressed", action="store_true")
+    interventions = sub.add_parser("recent-interventions", help="show recent bounded intervention episodes")
+    interventions.add_argument("--limit", type=int, default=20)
+    feedback = sub.add_parser("feedback", help="record explicit feedback for an intervention episode")
+    feedback.add_argument("episode_id_arg", nargs="?", metavar="EPISODE_ID")
+    feedback.add_argument("value_arg", nargs="?", metavar="VALUE")
+    feedback.add_argument("--episode", "--episode-id", dest="episode_option", type=int, action=_StoreOnce, help="intervention episode id")
+    feedback.add_argument("--value", dest="value_option", action=_StoreOnce, help="useful, dont-remind, more-proactive, timing-bad, or forget")
+    feedback.add_argument("--reaction", help="observed reaction such as opened, followed, or dismissed")
+    feedback.add_argument("--outcome", help="observed outcome such as resolved, unresolved, or deferred")
+    feedback.add_argument("--note", default="", help="short bounded note; do not include secrets or raw screen content")
+    sub.add_parser("profile", help="show the compact explainable secretary profile")
+    state_parser = sub.add_parser("current-state", help="show the current sanitized semantic GUI state")
+    state_parser.add_argument("--limit", type=int, default=None, help="bind recent transitions shown")
+    trajectory = sub.add_parser("trajectory", help="show the recent semantic trajectory")
+    trajectory.add_argument("--last", type=int, default=20, metavar="MINUTES", help="window in minutes (default 20)")
     sub.add_parser("benchmark", help="run the deterministic ten-scenario CPU benchmark")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     config = SecretaryConfig.from_environment()
     if args.command == "replay":
         raise SystemExit(run_replay(args.scenario, config))
@@ -497,6 +705,26 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(run_session_report(config))
     if args.command == "recent-decisions":
         raise SystemExit(run_recent_decisions(config, limit=args.limit, action=args.action, suppressed=args.suppressed))
+    if args.command == "recent-interventions":
+        raise SystemExit(run_recent_interventions(config, limit=args.limit))
+    if args.command == "feedback":
+        if args.episode_option is not None and (args.value_arg is not None or (args.value_option is not None and args.episode_id_arg is not None)):
+            parser.error("feedback accepts one episode id and one value; do not mix duplicate positional and option values")
+        if args.episode_option is not None:
+            episode_id = args.episode_option
+            value = args.value_option or args.value_arg or args.episode_id_arg
+        else:
+            if args.value_option is not None and args.value_arg is not None:
+                parser.error("feedback accepts either VALUE or --value, not both")
+            episode_id = args.episode_id_arg
+            value = args.value_option or args.value_arg
+        raise SystemExit(run_feedback(config, episode_id, value, reaction=args.reaction, outcome=args.outcome, note=args.note))
+    if args.command == "profile":
+        raise SystemExit(run_secretary_profile(config))
+    if args.command == "current-state":
+        raise SystemExit(run_current_state(config, output=sys.stdout))
+    if args.command == "trajectory":
+        raise SystemExit(run_gui_trajectory(config, minutes=args.last))
     if args.command == "benchmark":
         raise SystemExit(run_benchmark(config))
     if args.command == "run":

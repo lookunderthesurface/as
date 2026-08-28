@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from ..perception.extractor import ExtractedEvent
 
@@ -23,6 +24,7 @@ class WatchHypothesis:
     last_reason: str
     updated_at: datetime | None = None
     status: str = "ACTIVE"
+    instance_id: str | None = None
 
     @property
     def reason(self) -> str:
@@ -30,7 +32,9 @@ class WatchHypothesis:
 
     @property
     def watch_id(self) -> str:
-        return self.signature
+        # ``signature`` identifies the recurring problem; ``watch_id`` identifies
+        # this bounded lifecycle instance so an expired watch cannot close a new one.
+        return self.instance_id or self.signature
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -55,6 +59,9 @@ class WatchManager:
         self._active_signature: str | None = None
         self._history: list[WatchHypothesis] = []
         self._resolved_at: dict[str, datetime] = {}
+        self._transitions: list[dict[str, object]] = []
+        self._instance_prefix = uuid4().hex[:12]
+        self._next_instance_id = 1
 
     @property
     def active(self) -> WatchHypothesis | None:
@@ -73,6 +80,13 @@ class WatchManager:
             else:
                 item.status = "EXPIRED"
                 self._history.append(item)
+                self._transitions.append({
+                    "watch_id": item.watch_id,
+                    "signature": item.signature,
+                    "status": "EXPIRED",
+                    "outcome": "EXPIRED",
+                    "at": now.isoformat(),
+                })
         self._hypotheses = remaining
         expired = len(self._hypotheses) != before
         if self._active_signature and not any(item.signature == self._active_signature for item in self._hypotheses):
@@ -96,6 +110,13 @@ class WatchManager:
             item.updated_at = resolved_at
             self._resolved_at[item.signature] = resolved_at
             self._history.append(item)
+            self._transitions.append({
+                "watch_id": item.watch_id,
+                "signature": item.signature,
+                "status": "RESOLVED",
+                "outcome": "RESOLVED",
+                "at": resolved_at.isoformat(),
+            })
             self._hypotheses.remove(item)
         self._active_signature = self._hypotheses[-1].signature if self._hypotheses else None
         return True
@@ -107,6 +128,23 @@ class WatchManager:
 
     def history(self) -> list[dict[str, object]]:
         return [item.as_dict() for item in self._history[-20:]]
+
+    def drain_transitions(self) -> list[dict[str, object]]:
+        """Return lifecycle changes once so the runtime can persist them."""
+        transitions = self.peek_transitions()
+        self.acknowledge_transitions(transitions)
+        return transitions
+
+    def peek_transitions(self) -> list[dict[str, object]]:
+        return list(self._transitions)
+
+    def acknowledge_transitions(self, transitions: list[dict[str, object]]) -> None:
+        """Remove only transitions that the persistence layer handled."""
+        for transition in transitions:
+            try:
+                self._transitions.remove(transition)
+            except ValueError:
+                continue
 
     def _find(self, signature: str) -> WatchHypothesis | None:
         return next((item for item in self._hypotheses if item.signature == signature), None)
@@ -135,7 +173,9 @@ class WatchManager:
             updated_at=now,
             expires_at=now + timedelta(minutes=self.expiration_minutes),
             last_reason=_clean(reason, 300) or "watch created",
+            instance_id=f"watch-{self._instance_prefix}-{self._next_instance_id}",
         )
+        self._next_instance_id += 1
         self._hypotheses.append(item)
         self._active_signature = item.signature
         return item

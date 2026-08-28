@@ -29,6 +29,18 @@ COUNTER_NAMES = (
     "policy_notify_candidate",
     "would_notify",
     "real_notify",
+    "intervention_episodes_recorded",
+    "preference_matches",
+    "watch_resolved",
+    "watch_expired",
+    "visual_keyframes",
+    "visual_perception_calls",
+    "visual_perception_failures",
+    "structured_gui_updates",
+    "gui_states_recorded",
+    "gui_trajectory_events_recorded",
+    "gui_recoveries",
+    "gui_regressions",
 )
 
 
