@@ -322,10 +322,13 @@ class LLMConsolidator:
             ok, _reason = self.validator.validate(item)
             if not ok:
                 continue
+            statement = str(item.get("statement"))
+            if self._has_equivalent(statement):
+                continue
             accepted_items.append(item)
             episode_ids = [int(e) for e in (item.get("source_episode_ids") or [])]
             memory_id = self.store.record_memory(
-                str(item.get("statement")),
+                statement,
                 source=MemorySource.CONSOLIDATED,
                 importance=min(0.85, float(item.get("confidence") or 0.5) + 0.2),
                 tier=MemoryTier.SEMANTIC,
@@ -341,3 +344,12 @@ class LLMConsolidator:
             json.dumps(sorted({_episode_id(episode) for episode in episodes})[-200:], ensure_ascii=True),
         )
         return ConsolidationResult(len(episodes), produced, 0)
+
+    def _has_equivalent(self, statement: str) -> bool:
+        normalized = _normalize_text(statement)
+        for row in self.store.active_memories(tier=MemoryTier.SEMANTIC, limit=300):
+            if row.get("source") != MemorySource.CONSOLIDATED.value:
+                continue
+            if _normalize_text(str(row.get("content") or "")) == normalized:
+                return True
+        return False

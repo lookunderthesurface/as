@@ -118,34 +118,16 @@ def run_consolidate(config: SecretaryConfig | None = None, output=sys.stdout, *,
                 print("LLM consolidation requires INFERENCE_PROVIDER=ollama; using deterministic consolidation.", file=output)
                 result = MemoryConsolidator(store).consolidate().as_dict()
             else:
-                provider = OllamaInferenceProvider(
+                from .inference.completion import OllamaTextCompleter
+
+                completer = OllamaTextCompleter(
                     base_url=config.ollama_base_url,
-                    text_model=config.ollama_text_model,
-                    vision_model=config.ollama_vision_model,
+                    model=config.ollama_text_model,
                     timeout_seconds=config.ollama_timeout_seconds,
                     keep_alive=config.ollama_keep_alive,
                     temperature=config.ollama_temperature,
-                    think=config.ollama_think,
                 )
-
-                def _complete(prompt: str) -> str:
-                    from datetime import datetime as _dt, timezone as _tz
-
-                    from .events.schema import NormalizedEvent as _NE
-                    from .inference.schema import InferenceRequest as _IR
-
-                    stub = _NE(
-                        timestamp=_dt.now(_tz.utc), source="consolidator",
-                        foreground_app="secretary", window_title="memory consolidation",
-                        event_source="background", text="", text_source="internal",
-                        focused=False, screen_changed=False, visual_required=False,
-                    )
-                    outcome = provider.analyze(_IR(current_event=stub, context_text=prompt))
-                    return outcome.event.summary
-
-                result = LLMConsolidator(store, _complete).consolidate().as_dict()
-                if result.get("skipped_reason") is None and result.get("memories_produced", 0) == 0 and result.get("episodes_considered", 0) < 2:
-                    result = MemoryConsolidator(store).consolidate().as_dict()
+                result = LLMConsolidator(store, completer.complete).consolidate().as_dict()
         else:
             result = MemoryConsolidator(store).consolidate().as_dict()
         print("Ambient Secretary Memory Consolidation", file=output)

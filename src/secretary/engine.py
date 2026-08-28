@@ -154,19 +154,21 @@ class SecretaryEngine:
 
     def consolidate_memory(self, *, use_llm: bool = False) -> dict[str, object]:
         """Explicit, non-blocking consolidation trigger (deferred, safe)."""
+        from .inference.completion import OllamaTextCompleter
         from .memory.consolidation import LLMConsolidator, MemoryConsolidator
+        from .runtime_gpu import GPUStatusProvider
 
         if use_llm:
             gpu = self.gpu.snapshot()
-            from .runtime_gpu import GPUStatusProvider
-
             if GPUStatusProvider.dreaming_allowed(gpu.status):
-                def _complete(prompt: str) -> str:
-                    request = InferenceRequest(current_event=self._last_normalized_event or _stub_event(), context_text=prompt)
-                    result = self.inference.analyze(request)
-                    return result.event.summary
-
-                return LLMConsolidator(self.store, _complete).consolidate().as_dict()
+                completer = OllamaTextCompleter(
+                    base_url=self.config.ollama_base_url,
+                    model=self.config.ollama_text_model,
+                    timeout_seconds=self.config.ollama_timeout_seconds,
+                    keep_alive=self.config.ollama_keep_alive,
+                    temperature=self.config.ollama_temperature,
+                )
+                return LLMConsolidator(self.store, completer.complete).consolidate().as_dict()
         return MemoryConsolidator(self.store).consolidate(session_id=self.session_id).as_dict()
 
     def close(self) -> None:
