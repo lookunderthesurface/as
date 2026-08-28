@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-28T11:00:00Z","foreground_app":"Code.exe","window_title":"editor","event_source":"typing","text":"editing"}
+{"timestamp":"2026-08-28T11:00:20Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"python -m unittest"}
+{"timestamp":"2026-08-28T11:00:40Z","foreground_app":"chrome.exe","window_title":"GitHub","event_source":"navigation","text":"github issue discussion"}
+{"timestamp":"2026-08-28T11:01:00Z","foreground_app":"Code.exe","window_title":"editor","event_source":"typing","text":"editing"}
+

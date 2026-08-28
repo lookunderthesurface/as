@@ -1,0 +1,15 @@
+{
+  "type": "OCR",
+  "content": {
+    "app_name": "WindowsTerminal.exe",
+    "window_name": "Windows PowerShell",
+    "event_source": "click",
+    "text_source": "accessibility",
+    "text": "python -m unittest",
+    "focused": true,
+    "screen_changed": true,
+    "visual_required": false,
+    "frame_id": 1001,
+    "timestamp": "2026-08-28T08:00:00Z"
+  }
+}

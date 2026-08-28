@@ -1,0 +1,66 @@
+screenpipe:
+  base_url: http://127.0.0.1:3030
+  mode: managed
+  version: 0.4.41
+  disable_audio: true
+  disable_clipboard_capture: true
+  ignored_windows:
+    - 1Password
+    - KeePass
+
+capture:
+  provider: screenpipe
+
+inference:
+  provider: mock
+  min_interval_seconds: 10
+  max_pending_requests: 1
+  stale_request_seconds: 30
+  vision_cooldown_seconds: 30
+  max_text_chars: 6000
+  ollama:
+    base_url: http://127.0.0.1:11434
+    text_model: qwen3-vl:2b-instruct-q4_K_M
+    vision_model: qwen3-vl:2b-instruct-q4_K_M
+    timeout_seconds: 120
+    keep_alive: 30m
+    temperature: 0
+    think: false
+
+vision:
+  max_long_edge: 1280
+  jpeg_quality: 85
+  cooldown_seconds: 30
+
+cloud:
+  provider: mock
+
+privacy:
+  send_screenshots_to_cloud: false
+  excluded_apps:
+    - 1Password
+    - KeePass
+
+policy:
+  max_notifications_per_hour: 2
+  notification_cooldown_seconds: 300
+  watch_expiration_minutes: 20
+  max_active_hypotheses: 3
+  model:
+    remember_min_confidence: 0.75
+    remember_min_importance: 0.50
+    watch_min_confidence: 0.65
+    watch_min_importance: 0.50
+    investigate_min_confidence: 0.70
+    investigate_min_importance: 0.60
+    notify_min_confidence: 0.80
+    notify_min_importance: 0.75
+    notify_min_interrupt_score: 0.70
+    notify_min_watch_evidence: 2
+
+runtime:
+  shadow_mode: false
+
+storage:
+  database: data/state.db
+  log_directory: logs

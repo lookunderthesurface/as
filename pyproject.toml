@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ambient-secretary"
+version = "0.1.0"
+description = "A privacy-first proactive Windows work companion"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+windows = ["Pillow>=10", "pystray>=0.19", "winotify>=1.1"]
+
+[project.scripts]
+secretary = "secretary.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

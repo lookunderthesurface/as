@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-28T09:00:00Z","foreground_app":"Code.exe","window_title":"editor","event_source":"typing","text":"editing secretary engine"}
+{"timestamp":"2026-08-28T09:00:40Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"python -m unittest"}
+{"timestamp":"2026-08-28T09:01:20Z","foreground_app":"chrome.exe","window_title":"Python documentation","event_source":"navigation","text":"documentation"}
+{"timestamp":"2026-08-28T09:02:00Z","foreground_app":"Code.exe","window_title":"editor","event_source":"typing","text":"editing"}
+

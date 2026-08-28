@@ -1,0 +1,468 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .capture.lifecycle import ScreenpipeLifecycleManager
+from .capture.mock import MockCaptureProvider
+from .capture.screenpipe import ScreenpipeCaptureProvider
+from .config import SecretaryConfig, ensure_project_dirs, resolve_launcher
+from .controller import SecretaryController
+from .engine import SecretaryEngine
+from .events.normalize import normalize_fixture_item
+from .inference.mock import MockInferenceProvider
+from .inference.image import ImagePreprocessor
+from .inference.ollama import OllamaInferenceProvider
+from .inference.schema import InferenceRequest
+from .inference.status import InferenceRuntimeState, LocalInferenceStatus
+from .memory.store import MemoryStore
+from .notifications.mock import MockNotificationProvider
+from .notifications.shadow import ShadowNotificationProvider
+from .notifications.windows import WindowsNotificationProvider
+from .platform.windows.job_object import WindowsJobObject
+from .ui.tray import TrayApplication, TrayUnavailable
+
+
+def _scenario_items(path: Path) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSONL at line {line_number}: {exc.msg}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"scenario line {line_number} must be an object")
+        items.append(value)
+    return items
+
+
+def _elapsed_label(timestamp: datetime, start: datetime) -> str:
+    seconds = max(0, int((timestamp - start).total_seconds()))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def run_replay(path: Path, config: SecretaryConfig | None = None) -> int:
+    items = _scenario_items(path)
+    capture = MockCaptureProvider(items)
+    replay_items = [dict(item) for item in capture.poll()]
+    replay_config = config or SecretaryConfig.from_environment()
+    # Replays use an explicit MockCapture-equivalent input source and isolated DB.
+    engine = SecretaryEngine(replay_config, store=MemoryStore(":memory:"))
+    try:
+        timestamps = [normalize_fixture_item(item).timestamp for item in replay_items]
+        start = min(timestamps) if timestamps else datetime.now(timezone.utc)
+        for item in replay_items:
+            result = engine.process(item)
+            timestamp = normalize_fixture_item(item).timestamp
+            suffix = f" evidence={result.decision.evidence}" if result.decision.evidence else ""
+            if result.privacy_suppressed:
+                suffix += " privacy-suppressed"
+            print(f"{_elapsed_label(timestamp, start)} {result.decision.action.value}{suffix}")
+        print(f"notifications={len(getattr(engine.notifier, 'notifications', []))}")
+        return 0
+    finally:
+        engine.close()
+
+
+def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        report = store.latest_session_report()
+        print("Ambient Secretary Session", file=output)
+        if report is None:
+            print("\nNo session data recorded.", file=output)
+            return 0
+        duration = float(report["duration_seconds"])
+        print(f"\nSession: {report['session_id']}", file=output)
+        print(f"Duration: {int(duration // 60):02d}:{int(duration % 60):02d}", file=output)
+        print(f"Screenpipe events: {report['screenpipe_events']}", file=output)
+        print(f"Semantic inference requests: {report['semantic_inference_requests']}", file=output)
+        modes = report["inference_modes"]
+        print(f"Text inference: {modes.get('text', 0)}", file=output)
+        print(f"Vision inference: {modes.get('vision', 0)}", file=output)
+        print("\nCandidate actions:", file=output)
+        _print_action_counts(report["candidate_actions"], output)
+        print("\nFinal actions:", file=output)
+        _print_action_counts(report["final_actions"], output)
+        print(f"\nSuppressed model NOTIFY: {report['suppressed_model_notify']}", file=output)
+        print(f"Cloud escalation candidates (Mock only): {report['cloud_escalation_candidates']}", file=output)
+        if report["suppression_reasons"]:
+            print("Reasons:", file=output)
+            for reason, count in sorted(report["suppression_reasons"].items()):
+                print(f"- {reason}: {count}", file=output)
+        average = report["average_latency_ms"]
+        p95 = report["p95_latency_ms"]
+        print(f"\nAverage inference latency: {average:.1f} ms" if average is not None else "\nAverage inference latency: n/a", file=output)
+        print(f"P95 inference latency: {p95:.1f} ms" if p95 is not None else "P95 inference latency: n/a", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def _print_action_counts(counts: dict[str, int], output) -> None:
+    for action in ("IGNORE", "REMEMBER", "WATCH", "INVESTIGATE", "ASK_CLOUD", "NOTIFY", "WOULD_NOTIFY"):
+        if counts.get(action, 0):
+            print(f"{action:<13}{counts[action]}", file=output)
+
+
+def run_recent_decisions(config: SecretaryConfig | None = None, limit: int = 20, output=sys.stdout) -> int:
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        traces = list(reversed(store.recent_decision_traces(limit)))
+        print("Ambient Secretary Recent Decisions", file=output)
+        if not traces:
+            print("\nNo decision traces recorded.", file=output)
+            return 0
+        for trace in traces:
+            timestamp = str(trace["event_timestamp"]).replace("T", " ")[:19]
+            print(f"\n{timestamp}", file=output)
+            print(f"App: {trace['foreground_app']}", file=output)
+            print(f"Event: {trace['event_type']}", file=output)
+            print(f"Model: {trace['candidate_action']}", file=output)
+            print(f"Final: {trace['final_action']}", file=output)
+            print(f"confidence={float(trace['candidate_confidence']):.2f} importance={float(trace['candidate_importance']):.2f} interrupt={float(trace['interrupt_score']):.2f}", file=output)
+            print(f"deterministic_evidence={trace['deterministic_evidence']} watch_evidence={trace['watch_evidence']}", file=output)
+            if trace["suppression_reason"]:
+                print(f"suppression={trace['suppression_reason']}", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def _command_has_version(command: tuple[str, ...], version: str) -> bool:
+    return any(f"screenpipe@{version}" == token for token in command)
+
+
+def run_preflight(config: SecretaryConfig | None = None, output=sys.stdout) -> bool:
+    config = config or SecretaryConfig.from_environment()
+    ensure_project_dirs(config)
+    print("Ambient Secretary Preflight\n", file=output)
+
+    real_capture = config.capture_provider == "screenpipe"
+    launcher = resolve_launcher(config.screenpipe_command) is not None
+    version_ok = _command_has_version(config.screenpipe_command, "0.4.41")
+    key_available = bool(config.screenpipe_api_key)
+    managed = config.screenpipe_mode == "managed"
+    inference_configured = config.inference_provider in {"mock", "ollama"}
+    inference_label = "Local inference: MOCK" if config.inference_provider == "mock" else f"Local inference: {config.inference_provider}"
+    checks: list[tuple[str, str, bool, bool, str]] = [
+        ("OK" if platform.system() == "Windows" else "INFO", "Windows", True, False, platform.system()),
+        ("OK", "Python", sys.version_info >= (3, 10), True, platform.python_version()),
+        ("OK", "Project directory writable", os.access(config.project_root, os.W_OK), True, str(config.project_root)),
+        ("OK", "SQLite", _sqlite_check(), True, "stdlib"),
+        ("OK" if config.inference_provider == "mock" else "INFO", inference_label, inference_configured, config.inference_provider not in {"mock", "ollama"}, config.inference_provider),
+        ("OK", "Mock cloud", config.cloud_provider == "mock", True, config.cloud_provider),
+    ]
+    if real_capture:
+        checks.extend([
+            ("OK", "Screenpipe CLI launcher available", launcher, True, config.screenpipe_command[0]),
+            ("OK", "Configured Screenpipe version: 0.4.41", version_ok, True, "pinned command"),
+            ("OK", "SCREENPIPE_API_KEY available", key_available, True, "environment only"),
+            ("OK", "Managed lifecycle enabled", managed, True, config.screenpipe_mode),
+            ("OK", "Managed Screenpipe audio disabled", "--disable-audio" in config.screenpipe_command, managed, "record flag"),
+            ("OK", "Managed Screenpipe clipboard capture disabled", "--disable-clipboard-capture" in config.screenpipe_command, managed, "record flag"),
+            ("OK", "Managed Screenpipe excluded windows configured", (not config.excluded_apps) or "--ignored-windows" in config.screenpipe_command, managed, ",".join(config.excluded_apps)),
+        ])
+        provider = ScreenpipeCaptureProvider(config.screenpipe_base_url, config.screenpipe_api_key)
+        healthy = provider.health()
+        authenticated = provider.authenticated_search(limit=1) if healthy and key_available else False
+        if healthy and authenticated:
+            checks.append(("OK", "Screenpipe currently running", True, False, "health + authenticated search"))
+            checks.append(("OK", "Audio disabled", provider.audio_disabled(), True, "health"))
+            runtime_ready = True
+        elif provider.last_error_kind == "connection_refused":
+            checks.append(("INFO", "Screenpipe currently stopped", True, False, "127.0.0.1:3030"))
+            can_start = managed and launcher and version_ok and key_available
+            checks.append(("OK", "Secretary can start it when needed", can_start, True, "managed lifecycle"))
+            runtime_ready = can_start
+        else:
+            checks.append(("WARN", "Screenpipe runtime unavailable", False, True, provider.last_error or "not ready"))
+            runtime_ready = False
+        capture_ready = runtime_ready
+    else:
+        capture_ready = True
+        checks.append(("INFO", "Mock capture explicitly selected", True, False, "explicit test/replay mode"))
+
+    hard_fail = False
+    for level, name, ok, required, detail in checks:
+        shown_level = level if ok else ("WARN" if not required else "WARN")
+        print(f"[{shown_level}] {name}", file=output)
+        if not ok:
+            print(f"       {detail}", file=output)
+            if required:
+                hard_fail = True
+    if config.inference_provider == "mock":
+        print("[INFO] Ollama not required in current configuration", file=output)
+    elif config.inference_provider == "ollama":
+        print("[INFO] Ollama runtime not checked by offline preflight", file=output)
+    print(f"\nCapture readiness: {'PASS' if capture_ready else 'FAIL'}", file=output)
+    print(f"Development readiness: {'PASS' if not hard_fail and capture_ready else 'FAIL'}", file=output)
+    return not hard_fail and capture_ready
+
+
+def run_inference_status(config: SecretaryConfig | None = None, output=sys.stdout, probe: bool = False) -> int:
+    """Report configured local inference without probing any model runtime."""
+    config = config or SecretaryConfig.from_environment()
+    if config.inference_provider == "mock":
+        provider = MockInferenceProvider()
+    elif config.inference_provider == "ollama":
+        provider = OllamaInferenceProvider(
+            base_url=config.ollama_base_url,
+            text_model=config.ollama_text_model,
+            vision_model=config.ollama_vision_model,
+            timeout_seconds=config.ollama_timeout_seconds,
+            keep_alive=config.ollama_keep_alive,
+            temperature=config.ollama_temperature,
+            think=config.ollama_think,
+        )
+    else:
+        print(f"Local inference\n\nProvider: {config.inference_provider}\nStatus: DEGRADED\nReal model required: unknown", file=output)
+        return 1
+    status: LocalInferenceStatus = provider.status()
+    print("Local Inference", file=output)
+    print(f"\nProvider: {status.provider}", file=output)
+    print(f"Status: {status.status.value}", file=output)
+    if status.model:
+        print(f"Configured model: {status.model}", file=output)
+    print(f"Real model required: {'yes' if status.real_model_required else 'no'}", file=output)
+    if probe and config.inference_provider == "mock":
+        print("Runtime probe: skipped for MockInferenceProvider", file=output)
+    elif probe and config.inference_provider == "ollama":
+        result = provider.probe()
+        print(f"Runtime status: {result.status.value}", file=output)
+        print(f"Ollama version: {result.version or 'unavailable'}", file=output)
+        print(f"Configured model available: {'yes' if result.model_available else 'no'}", file=output)
+        if result.detail:
+            print(f"Probe detail: {result.detail}", file=output)
+        return 0 if result.status == InferenceRuntimeState.READY else 1
+    return 0
+
+
+def run_inference_smoke(config: SecretaryConfig | None, *, text: bool, image_path: Path | None, output=sys.stdout) -> int:
+    """Run one explicit Ollama request without starting Screenpipe."""
+    config = config or SecretaryConfig.from_environment()
+    if config.inference_provider != "ollama":
+        print("Inference smoke requires INFERENCE_PROVIDER=ollama; no Mock fallback is used.", file=output)
+        return 2
+    if not text and image_path is None:
+        print("Vision smoke requires an explicit image path.", file=output)
+        return 2
+
+    provider = OllamaInferenceProvider(
+        base_url=config.ollama_base_url,
+        text_model=config.ollama_text_model,
+        vision_model=config.ollama_vision_model,
+        timeout_seconds=config.ollama_timeout_seconds,
+        keep_alive=config.ollama_keep_alive,
+        temperature=config.ollama_temperature,
+        think=config.ollama_think,
+        image_preprocessor=ImagePreprocessor(config.vision_max_long_edge, config.vision_jpeg_quality),
+    )
+    use_vision = not text
+    if use_vision and provider.image_preprocessor.prepare_image(image_path) is None:
+        print("Vision smoke image preprocessing failed safely.", file=output)
+        return 2
+    smoke_context = (
+        "CURRENT EVENT\n"
+        "App: WindowsTerminal.exe\n"
+        "User ran pytest and received an AssertionError twice.\n\n"
+        "RECENT TRAJECTORY\n"
+        "VSCode editing test_attention.py\n"
+        "Terminal pytest failed\n"
+        "VSCode changed attention mask\n"
+        "Terminal pytest failed again"
+    )
+    raw_event = {
+        "source": "smoke",
+        "foreground_app": "WindowsTerminal.exe",
+        "window_title": "Secretary safe smoke fixture",
+        "event_source": "fixture",
+        "text": "pytest AssertionError repeated while debugging attention test",
+        "visual_required": use_vision,
+    }
+    event = normalize_fixture_item(raw_event)
+    request = InferenceRequest(
+        current_event=event,
+        image_path=str(image_path) if image_path else None,
+        use_vision=use_vision,
+        context_text=smoke_context,
+    )
+    result = provider.analyze(request)
+    mode = "vision" if use_vision else "text"
+    print("Inference smoke", file=output)
+    print(f"\nProvider: {result.provider}", file=output)
+    print(f"Model: {result.model or 'unconfigured'}", file=output)
+    print(f"Mode: {mode}", file=output)
+    if result.error_type:
+        print(f"Result: DEGRADED ({result.error_type})", file=output)
+    else:
+        print(f"event_type: {result.event.event_type}", file=output)
+        print(f"activity: {result.event.activity}", file=output)
+        print(f"topic: {result.event.topic or 'none'}", file=output)
+        print(f"importance: {result.event.importance:.3f}", file=output)
+        print(f"confidence: {result.event.confidence:.3f}", file=output)
+        print(f"candidate_action: {result.secretary.candidate_action.value}", file=output)
+        print(f"interrupt_score: {result.secretary.interrupt_score:.3f}", file=output)
+    if result.metrics:
+        print("\nMetrics:", file=output)
+        for key, value in result.metrics.as_dict().items():
+            print(f"{key}: {value}", file=output)
+    return 0 if result.error_type is None else 1
+
+
+def _sqlite_check() -> bool:
+    try:
+        store = MemoryStore(":memory:")
+        store.close()
+        return True
+    except Exception:
+        return False
+
+
+def run_live(config: SecretaryConfig, args: argparse.Namespace) -> int:
+    mock_capture = args.mock_capture or config.capture_provider == "mock"
+    shadow = bool(getattr(args, "shadow", False) or config.shadow_mode)
+    if shadow:
+        if config.inference_provider != "ollama":
+            print("Shadow mode requires INFERENCE_PROVIDER=ollama; no Mock inference run was started.")
+            return 2
+        notifier = ShadowNotificationProvider()
+        print("Shadow notification mode enabled: final NOTIFY is recorded as WOULD_NOTIFY; no Toast is shown.")
+    else:
+        notifier = MockNotificationProvider() if args.mock_notifications else WindowsNotificationProvider()
+    lifecycle: ScreenpipeLifecycleManager | None = None
+    if mock_capture:
+        print("Mock capture explicitly enabled; no desktop observation will be performed.")
+        capture: ScreenpipeCaptureProvider | MockCaptureProvider = MockCaptureProvider()
+    else:
+        provider = ScreenpipeCaptureProvider(config.screenpipe_base_url, config.screenpipe_api_key)
+        mode = "external" if args.external else ("managed" if args.managed else config.screenpipe_mode)
+        lifecycle = ScreenpipeLifecycleManager(
+            provider,
+            mode,
+            config.screenpipe_command,
+            job_factory=WindowsJobObject if mode == "managed" and os.name == "nt" else None,
+            ready_timeout=config.screenpipe_ready_timeout,
+        )
+        capture = provider
+
+    engine = SecretaryEngine(config, notifier=notifier)
+    controller = SecretaryController(
+        engine,
+        capture,
+        lifecycle=lifecycle,
+        poll_interval=args.interval,
+        supervision_interval=config.screenpipe_supervision_interval,
+    )
+    try:
+        status = controller.start()
+        if mock_capture:
+            print(f"Capture=MOCK (worker_alive={status.worker_alive}).")
+        elif status.capture_status != "READY":
+            print(f"capture_status=DEGRADED\nScreen perception unavailable: {status.error or 'Screenpipe is not ready'}")
+        else:
+            print(f"Capture=REAL Screenpipe (owned_by_secretary={status.owned_by_secretary}).")
+
+        def status_text() -> str:
+            inference_status = engine.inference_status()
+            return "\n".join((
+                "Ambient Secretary",
+                f"Capture: {controller.status().capture_status}",
+                f"Screenpipe: {controller.status().capture_status if lifecycle is not None else 'NOT_USED'}",
+                f"Local AI: {inference_status.status.value}",
+                f"Cloud: {config.cloud_provider.upper()}",
+                f"Watching: {'yes' if engine.watch.active else 'no'}",
+            ))
+
+        if args.tray:
+            try:
+                TrayApplication(controller.pause, controller.resume, status_text, controller.quit).run()
+                return 0
+            except TrayUnavailable as exc:
+                print(f"Tray unavailable: {exc}")
+        while True:
+            if args.once:
+                controller.wait_for_first_poll(timeout=max(2.0, args.interval + 1.0))
+                inference_timeout = getattr(getattr(engine, "inference", None), "timeout_seconds", 0.0)
+                try:
+                    drain_timeout = max(5.0, float(inference_timeout) + 5.0)
+                except (TypeError, ValueError):
+                    drain_timeout = 5.0
+                controller.wait_for_inference_idle(timeout=drain_timeout)
+                return 0 if controller.status().capture_status in {"READY", "MOCK"} else 2
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        controller.quit()
+        if config.inference_provider == "ollama":
+            final_inference_status = engine.inference_status()
+            if final_inference_status.last_mode:
+                metrics = final_inference_status.last_metrics
+                metric_text = ""
+                if metrics:
+                    metric_text = " " + " ".join(f"{key}={value}" for key, value in metrics.as_dict().items())
+                print(f"Local AI={final_inference_status.status.value} mode={final_inference_status.last_mode}{metric_text}")
+        engine.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="secretary", description="Ambient Secretary privacy-first work companion")
+    sub = parser.add_subparsers(dest="command", required=True)
+    replay = sub.add_parser("replay", help="replay a deterministic JSONL scenario")
+    replay.add_argument("scenario", type=Path)
+    sub.add_parser("preflight", help="check development and real-capture readiness")
+    status_parser = sub.add_parser("inference-status", help="show configured local inference")
+    status_parser.add_argument("--probe", action="store_true", help="explicitly query Ollama version, tags, and configured model")
+    smoke = sub.add_parser("inference-smoke", help="run one explicit local Ollama inference without Screenpipe")
+    smoke_mode = smoke.add_mutually_exclusive_group(required=True)
+    smoke_mode.add_argument("--text", action="store_true", help="run the safe text smoke context")
+    smoke_mode.add_argument("--vision", type=Path, metavar="IMAGE", help="run vision smoke with this explicit image path")
+    run = sub.add_parser("run", help="observe real Screenpipe by default")
+    run.add_argument("--once", action="store_true", help="poll once and exit")
+    run.add_argument("--interval", type=float, default=2.0)
+    lifecycle = run.add_mutually_exclusive_group()
+    lifecycle.add_argument("--managed", action="store_true", help="use managed Screenpipe lifecycle")
+    lifecycle.add_argument("--external", action="store_true", help="reuse an existing Screenpipe only")
+    run.add_argument("--mock-capture", action="store_true", help="explicit test-only fake capture mode")
+    run.add_argument("--mock-notifications", action="store_true", help="explicit test-only mock notification mode")
+    run.add_argument("--shadow", action="store_true", help="real capture/inference/policy with notifications suppressed")
+    run.add_argument("--notify", action="store_true", help="compatibility flag; real Toast is the default")
+    run.add_argument("--tray", action="store_true", help="run the optional real system tray shell")
+    sub.add_parser("session-report", help="show the latest bounded session decision report")
+    recent = sub.add_parser("recent-decisions", help="show recent bounded decision traces")
+    recent.add_argument("--limit", type=int, default=20)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    config = SecretaryConfig.from_environment()
+    if args.command == "replay":
+        raise SystemExit(run_replay(args.scenario, config))
+    if args.command == "preflight":
+        raise SystemExit(0 if run_preflight(config) else 1)
+    if args.command == "inference-status":
+        raise SystemExit(run_inference_status(config, probe=args.probe))
+    if args.command == "inference-smoke":
+        raise SystemExit(run_inference_smoke(config, text=args.text, image_path=args.vision))
+    if args.command == "session-report":
+        raise SystemExit(run_session_report(config))
+    if args.command == "recent-decisions":
+        raise SystemExit(run_recent_decisions(config, limit=args.limit))
+    if args.command == "run":
+        raise SystemExit(run_live(config, args))
+
+
+if __name__ == "__main__":
+    main()
