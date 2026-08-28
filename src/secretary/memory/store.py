@@ -524,6 +524,17 @@ class MemoryStore:
         row = self.connection.execute("SELECT * FROM memories WHERE id = ?", (int(memory_id),)).fetchone()
         return _decode_memory(dict(row)) if row else None
 
+    def get_meta(self, key: str) -> str | None:
+        row = self.connection.execute("SELECT value FROM schema_meta WHERE key = ?", (str(key)[:120],)).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.connection.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(key)[:120], str(value)[:2000]),
+        )
+        self.connection.commit()
+
     def active_memories(
         self,
         *,

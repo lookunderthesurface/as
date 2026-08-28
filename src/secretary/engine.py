@@ -144,11 +144,21 @@ class SecretaryEngine:
         )
         self.logger = build_logger(self.config.log_directory)
 
+    def consolidate_memory(self) -> dict[str, object]:
+        """Explicit, non-blocking consolidation trigger (deferred, safe)."""
+        from .memory.consolidation import MemoryConsolidator
+
+        return MemoryConsolidator(self.store).consolidate(session_id=self.session_id).as_dict()
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._persist_gui_trajectory()
+        try:
+            self.consolidate_memory()
+        except Exception:
+            self.logger.warning("event_type=memory_consolidation_skipped error_class=exception")
         self.store.end_session(self.session_id, {"counters": self.counters.snapshot()})
         self.store.close()
         close_logger(self.logger)

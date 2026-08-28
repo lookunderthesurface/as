@@ -106,6 +106,28 @@ def run_label_summary(config: SecretaryConfig | None = None, output=sys.stdout) 
         store.close()
 
 
+def run_consolidate(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    """Explicit background consolidation; never mutates source episodes."""
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        from .memory.consolidation import MemoryConsolidator
+
+        result = MemoryConsolidator(store).consolidate().as_dict()
+        print("Ambient Secretary Memory Consolidation", file=output)
+        print(f"\nEpisodes considered: {result['episodes_considered']}", file=output)
+        print(f"Durable memories produced: {result['memories_produced']}", file=output)
+        print(f"Superseded older equivalents: {result['superseded']}", file=output)
+        if result.get("skipped_reason"):
+            print(f"Skipped: {result['skipped_reason']}", file=output)
+        memories = store.active_memories(tier="SEMANTIC", limit=10)
+        for row in memories:
+            print(f"- {row['content']}  [confidence={float(row['confidence']):.2f}]", file=output)
+        return 0
+    finally:
+        store.close()
+
+
 def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
     config = config or SecretaryConfig.from_environment()
     store = MemoryStore(config.database_path)
@@ -752,7 +774,8 @@ def build_parser() -> argparse.ArgumentParser:
     label_parser.add_argument("episode_id", type=int, metavar="EPISODE_ID")
     label_parser.add_argument("value", metavar="VALUE", help="useful, not-useful, needed-but-bad-timing, not-needed, or unsure")
     label_parser.add_argument("--note", default="", help="optional short bounded note, no secrets")
-    labels = sub.add_parser("label-summary", help="show intervention label counts (evaluation-safe, no fabricated TP/FP)")
+    labels =     sub.add_parser("label-summary", help="show intervention label counts (evaluation-safe, no fabricated TP/FP)")
+    sub.add_parser("consolidate", help="run one background memory consolidation (deferred, safe)")
     interventions = sub.add_parser("recent-interventions", help="show recent bounded intervention episodes")
     interventions.add_argument("--limit", type=int, default=20)
     feedback = sub.add_parser("feedback", help="record explicit feedback for an intervention episode")
@@ -796,6 +819,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(run_label_episode(config, args.episode_id, args.value, note=args.note))
     if args.command == "label-summary":
         raise SystemExit(run_label_summary(config))
+    if args.command == "consolidate":
+        raise SystemExit(run_consolidate(config))
     if args.command == "feedback":
         if args.episode_option is not None and (args.value_arg is not None or (args.value_option is not None and args.episode_id_arg is not None)):
             parser.error("feedback accepts one episode id and one value; do not mix duplicate positional and option values")
