@@ -496,6 +496,10 @@ class SecretaryEngine:
                 self.counters.increment("gui_recoveries")
             if delta is not None and delta.regression:
                 self.counters.increment("gui_regressions")
+            # Kill-safe trajectory: flush incrementally; the unique index makes
+            # the final close() flush idempotent.
+            if self.counters.snapshot().get("gui_states_recorded", 0) % 20 == 0:
+                self._persist_gui_trajectory()
         except Exception:
             self.logger.warning("event_type=gui_state_persist_error error_class=sqlite")
 
