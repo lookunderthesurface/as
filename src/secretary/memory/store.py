@@ -10,6 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .hierarchy import (
+    CORE_MEMORY_CHARS_LIMIT,
+    CONTEXT_EPISODE_BUDGET,
+    CONTEXT_MEMORY_CHARS_BUDGET,
+    MemorySource,
+    MemoryStatus,
+    MemoryTier,
+    SOURCE_WEIGHT,
+)
 from .intervention import (
     InterventionLabel,
     InterventionOutcome,
@@ -57,7 +66,15 @@ CREATE TABLE IF NOT EXISTS memories (
     source TEXT NOT NULL,
     content TEXT NOT NULL,
     importance REAL NOT NULL DEFAULT 0.5,
-    tags TEXT NOT NULL DEFAULT ''
+    tags TEXT NOT NULL DEFAULT '',
+    tier TEXT NOT NULL DEFAULT 'SEMANTIC',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    confidence REAL NOT NULL DEFAULT 0.5,
+    source_episode_ids TEXT NOT NULL DEFAULT '[]',
+    supersedes_id INTEGER,
+    provider TEXT,
+    model TEXT,
+    updated_at TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, tags, content='memories', content_rowid='id');
 CREATE TABLE IF NOT EXISTS hypotheses (
@@ -250,7 +267,7 @@ _LABEL_ALIASES = {
 
 class MemoryStore:
     # Intervention tables and trace columns are an additive schema migration.
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(self, path: str | Path = "data/state.db") -> None:
         self.path = str(path)
@@ -282,6 +299,14 @@ class MemoryStore:
         self._ensure_column("intervention_episodes", "learned_preference_id", "INTEGER")
         self._ensure_column("intervention_episodes", "user_label", "TEXT")
         self._ensure_column("intervention_episodes", "labeled_at", "TEXT")
+        self._ensure_column("memories", "tier", "TEXT NOT NULL DEFAULT 'SEMANTIC'")
+        self._ensure_column("memories", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'")
+        self._ensure_column("memories", "confidence", "REAL NOT NULL DEFAULT 0.5")
+        self._ensure_column("memories", "source_episode_ids", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("memories", "supersedes_id", "INTEGER")
+        self._ensure_column("memories", "provider", "TEXT")
+        self._ensure_column("memories", "model", "TEXT")
+        self._ensure_column("memories", "updated_at", "TEXT")
         self._migrate_privacy_labels()
         self.connection.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.connection.execute(
@@ -357,6 +382,10 @@ class MemoryStore:
                     "INSERT INTO memories_fts(rowid, content, tags) SELECT id, content, tags FROM memories WHERE id = ?",
                     (int(row["id"]),),
                 )
+        for row in self.connection.execute("SELECT id, source FROM memories WHERE source IS NOT NULL").fetchall():
+            normalized = _normalize_memory_source(row["source"])
+            if normalized != row["source"]:
+                self.connection.execute("UPDATE memories SET source = ? WHERE id = ?", (normalized, int(row["id"])))
         for row in self.connection.execute("SELECT id, note FROM feedback WHERE note IS NOT NULL").fetchall():
             note = sanitize_semantic_label(row["note"], 400) or None
             if note != row["note"]:
@@ -436,23 +465,123 @@ class MemoryStore:
             ).fetchone()
         return int(row["count"] if row else 0)
 
-    def record_memory(self, content: str, source: str = "secretary", importance: float = 0.5, tags: str = "") -> None:
+    def record_memory(
+        self,
+        content: str,
+        source: str = "secretary",
+        importance: float = 0.5,
+        tags: str = "",
+        *,
+        tier: MemoryTier | str = MemoryTier.SEMANTIC,
+        status: MemoryStatus | str = MemoryStatus.ACTIVE,
+        confidence: float = 0.5,
+        source_episode_ids: Sequence[int] = (),
+        supersedes_id: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> int:
         safe_content = sanitize_semantic_label(content, 1000)
         safe_tags = sanitize_semantic_label(tags, 300)
+        source_value = _normalize_memory_source(source)
+        now = _utc_iso()
         cursor = self.connection.execute(
-            "INSERT INTO memories(created_at, source, content, importance, tags) VALUES (?, ?, ?, ?, ?)",
-            (_utc_iso(), source, safe_content, importance, safe_tags),
+            """INSERT INTO memories(
+                created_at, source, content, importance, tags, tier, status,
+                confidence, source_episode_ids, supersedes_id, provider, model, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                now,
+                source_value,
+                safe_content,
+                _probability(importance),
+                safe_tags,
+                _enum_text(tier, MemoryTier.SEMANTIC),
+                _enum_text(status, MemoryStatus.ACTIVE),
+                _probability(confidence),
+                json.dumps(_safe_ids(list(source_episode_ids)[:8]), ensure_ascii=True),
+                supersedes_id,
+                _bounded(provider, 80, "") or None,
+                _bounded(model, 160, "") or None,
+                now,
+            ),
         )
         row_id = cursor.lastrowid
         self.connection.execute("INSERT INTO memories_fts(rowid, content, tags) VALUES (?, ?, ?)", (row_id, safe_content, safe_tags))
         self.connection.commit()
+        return int(row_id)
 
     def search_memories(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT m.* FROM memories m JOIN memories_fts f ON f.rowid = m.id WHERE memories_fts MATCH ? ORDER BY m.importance DESC, m.created_at DESC LIMIT ?",
             (query, max(1, min(20, limit))),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [_decode_memory(dict(row)) for row in rows]
+
+    def get_memory(self, memory_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM memories WHERE id = ?", (int(memory_id),)).fetchone()
+        return _decode_memory(dict(row)) if row else None
+
+    def active_memories(
+        self,
+        *,
+        tier: MemoryTier | str | None = None,
+        exclude_superseded: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        where, params = ["status = ?"], [MemoryStatus.ACTIVE.value]
+        if tier is not None:
+            where.append("tier = ?")
+            params.append(_enum_text(tier, tier))
+        if exclude_superseded:
+            pass  # status='ACTIVE' already excludes superseded/expired rows
+        rows = self.connection.execute(
+            f"SELECT * FROM memories WHERE {' AND '.join(where)} ORDER BY importance DESC, updated_at DESC, id DESC LIMIT ?",
+            (*params, max(1, min(500, int(limit)))),
+        ).fetchall()
+        return [_decode_memory(dict(row)) for row in rows]
+
+    def core_memory(self) -> list[dict[str, Any]]:
+        return self.active_memories(tier=MemoryTier.CORE, limit=50)
+
+    def get_memory_context(self, *, max_chars: int = CONTEXT_MEMORY_CHARS_BUDGET, max_episodes: int = CONTEXT_EPISODE_BUDGET) -> dict[str, Any]:
+        """Bounded memory slice for one context build: core always + top episodic."""
+        core_rows = self.core_memory()
+        core_text = "\n".join(
+            f"{sanitize_semantic_label(row['content'], 200)} [source={row['source']}]" for row in core_rows
+        )
+        episodic_rows = self.active_memories(tier=MemoryTier.EPISODIC, limit=max_episodes)
+        episodic_text = "\n".join(
+            f"{sanitize_semantic_label(row['content'], 240)}" for row in episodic_rows
+        )
+        return {
+            "core_memory_chars": len(core_text),
+            "retrieved_memory_chars": len(episodic_text),
+            "episode_count": len(episodic_rows),
+            "core_memory": core_text,
+            "retrieved_memory": episodic_text,
+        }
+
+    def supersede_memory(self, memory_id: int, *, replacing_with: int | None = None) -> bool:
+        row = self.connection.execute("SELECT id FROM memories WHERE id = ? AND status = ?", (int(memory_id), MemoryStatus.ACTIVE.value)).fetchone()
+        if row is None:
+            return False
+        self.connection.execute(
+            "UPDATE memories SET status = ?, updated_at = ?, supersedes_id = ? WHERE id = ?",
+            (MemoryStatus.SUPERSEDED.value, _utc_iso(), replacing_with, int(memory_id)),
+        )
+        self.connection.commit()
+        return True
+
+    def expire_memory(self, memory_id: int) -> bool:
+        row = self.connection.execute("SELECT id FROM memories WHERE id = ? AND status = ?", (int(memory_id), MemoryStatus.ACTIVE.value)).fetchone()
+        if row is None:
+            return False
+        self.connection.execute(
+            "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
+            (MemoryStatus.EXPIRED.value, _utc_iso(), int(memory_id)),
+        )
+        self.connection.commit()
+        return True
 
     def record_intervention_episode(
         self,
@@ -1313,6 +1442,34 @@ def _decode_gui_state(row: dict[str, Any]) -> dict[str, Any]:
 
 def _decode_trajectory_event(row: dict[str, Any]) -> dict[str, Any]:
     row["importance"] = float(row.get("importance", 0.1))
+    return row
+
+
+_MEMORY_SOURCE_ALIASES = {
+    "secretary": MemorySource.SYSTEM_DEFAULT.value,
+    "system": MemorySource.SYSTEM_DEFAULT.value,
+    "user": MemorySource.EXPLICIT_USER.value,
+    "explicit": MemorySource.EXPLICIT_USER.value,
+    "consolidated": MemorySource.CONSOLIDATED.value,
+    "observed": MemorySource.OBSERVED_EVENT.value,
+    "observed_outcome": MemorySource.OBSERVED_OUTCOME.value,
+    "model": MemorySource.MODEL_INFERENCE.value,
+    "model_inference": MemorySource.MODEL_INFERENCE.value,
+}
+
+
+def _normalize_memory_source(value: object) -> str:
+    raw = str(value or "").strip().upper().replace(" ", "_")
+    try:
+        return MemorySource(raw).value
+    except ValueError:
+        return _MEMORY_SOURCE_ALIASES.get(str(value or "").strip().lower(), raw or MemorySource.SYSTEM_DEFAULT.value)
+
+
+def _decode_memory(row: dict[str, Any]) -> dict[str, Any]:
+    row["importance"] = float(row.get("importance", 0.5))
+    row["confidence"] = float(row.get("confidence", 0.5))
+    row["source_episode_ids"] = _decode_json_list(row.get("source_episode_ids", "[]"))
     return row
 
 
