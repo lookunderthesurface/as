@@ -226,6 +226,27 @@ package is created by the project. The optional package cache entry mentioned in
   which is also asserted as defense in depth in `VisualCognition`. All
   synthetic GUI fixtures under `tests/fixtures/gui/` are generated safe
   images with no real screen content.
+- The continuing-agent core owns a single deterministic state transition
+  (`WorldStateReducer`); policy receives a bounded `DecisionContext` instead
+  of reaching into stores. `STAY_SILENT` (IGNORE) is the expected common
+  action, not a failure.
+- Intervention feedback is weighted: explicit labels (ACCEPTED/REJECTED/
+  EXPLICIT_*) are durable; implicit observations (OPENED/IGNORED) are weak
+  evidence and cannot alone create a permanent preference. Shadow-mode
+  opportunities can be human-labeled (`pending-labels`, `label`,
+  `label-summary`) without mutating policy.
+- Memory is a four-tier hierarchy over SQLite: CORE (small, always loaded),
+  EPISODIC (summarized happenings), SEMANTIC (durable facts with
+  source/confidence/status/supersession), INTERVENTION (what to remind).
+  `MODEL_INFERENCE` facts are capped at 0.6 confidence and cannot shape the
+  profile alone. `memory-doctor` is a read-only hygiene dry-run; `consolidate`
+  runs deferred background consolidation from episode evidence (auditable via
+  source_episode_ids + provider + confidence).
+- Online evaluation stays honest: `evaluate` reports counts always and
+  precision/false-alarm only over human-labeled ground truth (never fabricated).
+  A `ProactiveBench`-style adapter (`load_bench_items` /
+  `run_proactive_bench`) runs synthetic GUI traces offline with zero runtime
+  dependencies.
 
 ## Tests
 
