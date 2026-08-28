@@ -247,6 +247,29 @@ package is created by the project. The optional package cache entry mentioned in
   A `ProactiveBench`-style adapter (`load_bench_items` /
   `run_proactive_bench`) runs synthetic GUI traces offline with zero runtime
   dependencies.
+- Intervention learning closes the loop: the deterministic
+  `InterventionCritic` scores utility (memory relevance, timing, content
+  quality, urgency, interrupt cost, false-alarm risk) with reason codes and
+  may only annotate or suppress (`SILENT`), never escalate. WATCH hypotheses
+  accumulate explainable evidence (`readiness`: repetition + research +
+  duration + memory support). Retrieved durable knowledge makes repeated-
+  failure suggestions concrete (`RELATED_PAST_SOLUTION_AVAILABLE`), and
+  recent explicit rejections silence similar future proposals.
+- Feedback has two axes: `secretary feedback <id> --timing <good|too-early|
+  too-late|bad|silent> --content <relevant|irrelevant|already-knew|wrong|
+  useful|too-generic>` learns TIMING and CONTENT knowledge into separate
+  durable memories. Shadow labels (`label <id> ...`) separate
+  `GOOD_CONTENT_BAD_TIMING` from `GOOD_TIMING_BAD_CONTENT`.
+- GPU-aware compute budget: `GPUStatusProvider` reads nvidia-smi (no CUDA
+  toolkit) and maps utilization to IDLE/NORMAL/BUSY/CRITICAL. Perception
+  gaps widen under pressure and dreaming pauses at CRITICAL — the secretary
+  uses the user's GPU, it never fights for it.
+- LLM-assisted dreaming (`secretary consolidate --llm`) runs the local text
+  model over privacy-filtered episode metadata and every proposal passes a
+  strict validator (source episodes must exist, confidence ≤ 0.75, bounded
+  statements, duplicate demotion) before persistence. Any failure falls back
+  to deterministic consolidation. Related design notes:
+  [docs/RELATED_AGENT_DESIGN.md](docs/RELATED_AGENT_DESIGN.md).
 
 ## Tests
 

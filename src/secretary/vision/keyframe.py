@@ -73,7 +73,7 @@ class VisualKeyframeScheduler:
     def __init__(
         self,
         *,
-        min_visual_interval_seconds: float = 8.0,
+        min_visual_interval_seconds: float = 45.0,
         forced_visual_interval_seconds: float = 90.0,
         same_app_lookback: int = 3,
     ) -> None:
@@ -118,6 +118,19 @@ class VisualKeyframeScheduler:
         forced_refresh = self._last_visual_at is not None and (current - self._last_visual_at) >= self._forced_interval if self._last_visual_at is not None else False
         if forced_refresh:
             visual_signals.append("periodic_refresh")
+
+        # Visual cooldown: low-priority visual signals (screen_changed,
+        # visual_content_app) must not burn a VLM call every frame. High
+        # priority signals (app switch, fresh error, visual_required, forced
+        # refresh) bypass the cooldown because they carry real novelty.
+        if visual_signals and self._last_visual_at is not None:
+            priority = any(
+                signal in {"application_changed", "new_error_observed", "visual_required", "periodic_refresh"}
+                for signal in visual_signals
+            )
+            if not priority and (current - self._last_visual_at) < self._min_interval:
+                structured_signals.append("visual_cooldown_throttled")
+                visual_signals = []
 
         if visual_signals:
             self._last_visual_at = current

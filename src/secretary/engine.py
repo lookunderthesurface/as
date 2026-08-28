@@ -42,6 +42,7 @@ from .privacy.filter import PrivacyFilter
 from .runtime import RuntimeCounters
 from .runtime_gpu import GPUStatusProvider
 from .vision.cognition import VisualCognition
+from .vision.keyframe import VisualKeyframeScheduler
 from .vision.mock_gui import MockGUIPerceptionProvider
 from .vision.ollama_gui import GUIPerceptionOllamaProvider
 from .vision.world import DesktopWorldState
@@ -199,7 +200,11 @@ class SecretaryEngine:
             perception = GUIPerceptionOllamaProvider(self.inference)
         else:
             perception = MockGUIPerceptionProvider()
-        return VisualCognition(perception, world=DesktopWorldState(), excluded_apps=self.config.excluded_apps)
+        keyframes = VisualKeyframeScheduler(
+            min_visual_interval_seconds=self.config.gui_perception_min_interval_seconds,
+            forced_visual_interval_seconds=max(90.0, self.config.gui_perception_min_interval_seconds * 2.0),
+        )
+        return VisualCognition(perception, world=DesktopWorldState(), keyframes=keyframes, excluded_apps=self.config.excluded_apps)
 
     @staticmethod
     def _stub_event() -> NormalizedEvent:

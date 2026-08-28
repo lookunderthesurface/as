@@ -103,6 +103,49 @@ class KeyframeTests(unittest.TestCase):
         decision = scheduler.evaluate(std_event("dotnet build 12 modules compiled"), now=NOW + timedelta(seconds=30))
         self.assertEqual(decision.level, KEYFRAME_STRUCTURED)
 
+    def test_visual_content_app_respects_cooldown(self) -> None:
+        """Real-shadow regression: visual_content_app must not fire every frame."""
+        scheduler = VisualKeyframeScheduler(min_visual_interval_seconds=45.0)
+        raw = {
+            "timestamp": NOW.isoformat(),
+            "foreground_app": "Code.exe",
+            "window_title": "attention.py",
+            "event_source": "screen",
+            "text": "editing attention layout",
+        }
+        first = scheduler.evaluate(normalize_fixture_item(raw), now=NOW)
+        self.assertEqual(first.level, KEYFRAME_VISUAL)
+        # Same window, text-only change 10s later: throttled to STRUCTURED.
+        throttled = scheduler.evaluate(
+            normalize_fixture_item({**raw, "timestamp": (NOW + timedelta(seconds=10)).isoformat(), "text": "editing attention layout v2"}),
+            now=NOW + timedelta(seconds=10),
+        )
+        self.assertEqual(throttled.level, KEYFRAME_STRUCTURED)
+        self.assertIn("visual_cooldown_throttled", throttled.reason)
+        # After the cooldown elapses, a plain visual-content frame is visual again.
+        later = scheduler.evaluate(
+            normalize_fixture_item({**raw, "timestamp": (NOW + timedelta(minutes=2)).isoformat()}),
+            now=NOW + timedelta(minutes=2),
+        )
+        self.assertEqual(later.level, KEYFRAME_VISUAL)
+
+    def test_high_priority_signals_bypass_cooldown(self) -> None:
+        scheduler = VisualKeyframeScheduler(min_visual_interval_seconds=45.0)
+        base = {
+            "timestamp": NOW.isoformat(),
+            "foreground_app": "Code.exe",
+            "window_title": "attention.py",
+            "event_source": "screen",
+            "text": "editing",
+        }
+        scheduler.evaluate(normalize_fixture_item(base), now=NOW)
+        error_soon = scheduler.evaluate(
+            normalize_fixture_item({**base, "timestamp": (NOW + timedelta(seconds=5)).isoformat(), "text": "pytest FAILED"}),
+            now=NOW + timedelta(seconds=5),
+        )
+        self.assertEqual(error_soon.level, KEYFRAME_VISUAL)
+        self.assertIn("new_error_observed", error_soon.reason)
+
     def test_visual_required_is_always_visual(self) -> None:
         scheduler = VisualKeyframeScheduler()
         raw = {

@@ -52,6 +52,7 @@ class SecretaryConfig:
     inference_stale_result_seconds: float = 30.0
     inference_stale_result_generation_gap: int = 2
     inference_vision_cooldown_seconds: float = 30.0
+    gui_perception_min_interval_seconds: float = 45.0
     inference_max_text_chars: int = 6000
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_text_model: str = "qwen3-vl:2b-instruct-q4_K_M"
@@ -154,6 +155,10 @@ class SecretaryConfig:
         except ValueError:
             vision_cooldown = 30.0
         try:
+            gui_perception_min_interval = max(5.0, float(os.getenv("GUI_PERCEPTION_MIN_INTERVAL_SECONDS", "45")))
+        except ValueError:
+            gui_perception_min_interval = 45.0
+        try:
             max_text_chars = max(500, int(os.getenv("INFERENCE_MAX_TEXT_CHARS", "6000")))
         except ValueError:
             max_text_chars = 6000
@@ -210,6 +215,7 @@ class SecretaryConfig:
             inference_stale_result_seconds=inference_stale_result,
             inference_stale_result_generation_gap=inference_stale_generation_gap,
             inference_vision_cooldown_seconds=vision_cooldown,
+            gui_perception_min_interval_seconds=gui_perception_min_interval,
             inference_max_text_chars=max_text_chars,
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
             ollama_text_model=os.getenv("OLLAMA_TEXT_MODEL", "qwen3-vl:2b-instruct-q4_K_M"),
