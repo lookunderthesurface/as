@@ -14,6 +14,7 @@ from .hierarchy import (
     CORE_MEMORY_CHARS_LIMIT,
     CONTEXT_EPISODE_BUDGET,
     CONTEXT_MEMORY_CHARS_BUDGET,
+    MODEL_INFERENCE_MAX_CONFIDENCE,
     MemorySource,
     MemoryStatus,
     MemoryTier,
@@ -483,6 +484,8 @@ class MemoryStore:
         safe_content = sanitize_semantic_label(content, 1000)
         safe_tags = sanitize_semantic_label(tags, 300)
         source_value = _normalize_memory_source(source)
+        if source_value == MemorySource.MODEL_INFERENCE.value:
+            confidence = min(float(confidence), MODEL_INFERENCE_MAX_CONFIDENCE)
         now = _utc_iso()
         cursor = self.connection.execute(
             """INSERT INTO memories(
@@ -1459,6 +1462,10 @@ _MEMORY_SOURCE_ALIASES = {
 
 
 def _normalize_memory_source(value: object) -> str:
+    if isinstance(value, MemorySource):
+        return value.value
+    if isinstance(value, str) and hasattr(MemorySource, value) and value in {item.name for item in MemorySource}:
+        return MemorySource(value).value
     raw = str(value or "").strip().upper().replace(" ", "_")
     try:
         return MemorySource(raw).value
