@@ -30,6 +30,7 @@ from .inference.status import InferenceRuntimeState, LocalInferenceStatus
 from .memory.intervention import classify_situation
 from .memory.retrieval import retrieve_relevant_intervention_preferences, retrieve_similar_intervention_episodes
 from .perception.extractor import ExtractedEvent, EventExtractor
+from .policy.context import DecisionContext
 from .policy.hard_rules import HardRules
 from .policy.proactive import Action, Decision, PolicyThresholds, ProactivePolicy
 from .policy.watch import WatchManager
@@ -570,13 +571,19 @@ class SecretaryEngine:
         similar_episodes = retrieve_similar_intervention_episodes(self.store, extracted)
         if preferences:
             self.counters.increment("preference_matches")
-        decision = self.policy.decide(
-            extracted,
-            self.state,
-            failure_count + (1 if extracted.failure_signature else 0),
-            event.timestamp,
-            preferences=preferences,
-            similar_episodes=similar_episodes,
+        decision = self.policy.decide_context(
+            DecisionContext(
+                event=extracted,
+                working_state=self.state,
+                now=event.timestamp,
+                failure_count=failure_count + (1 if extracted.failure_signature else 0),
+                activation_failure_count=failure_count + (1 if extracted.failure_signature else 0),
+                active_watch=self.watch.active,
+                watch_snapshot=tuple(self.watch.snapshot()),
+                world_state=self.cognition.world,
+                preferences=tuple(preferences),
+                similar_episodes=tuple(similar_episodes),
+            )
         )
         transitions = self.watch.peek_transitions()
         self.store.record_event(extracted, source=event.source, session_id=self.session_id)

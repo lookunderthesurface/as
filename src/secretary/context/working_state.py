@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from ..perception.extractor import ExtractedEvent
+from ..state.reducer import Observation, WorldStateReducer
 
 
 @dataclass
@@ -21,36 +22,18 @@ class WorkingState:
     pending_reminders: deque[str] = field(default_factory=lambda: deque(maxlen=10))
 
     def observe(self, event: ExtractedEvent, *, allow_objective_update: bool = True) -> None:
-        if event.app in self.active_apps:
-            self.active_apps.remove(event.app)
-        self.active_apps.append(event.app)
-        self.active_apps = self.active_apps[-8:]
-        self.recent_events.append({
-            "timestamp": getattr(event.timestamp, "isoformat", lambda: str(event.timestamp))(),
-            "event_type": event.event_type,
-            "activity": event.activity,
-            "app": event.app,
-            "summary": event.summary,
-        })
-        if event.event_type in {"recovery", "success"}:
-            self.current_objective = None
-            self.current_subgoal = None
-            self.current_topic = None
-        elif event.failure_signature:
-            known_failure = event.failure_signature in self.recent_failures
-            self.recent_failures.append(event.failure_signature)
-            # Do not let a low-confidence, late result hijack the current
-            # objective. A strong model signal or an already-known failure may
-            # update the state; stale results use allow_objective_update=False.
-            if allow_objective_update and (event.confidence >= 0.8 or known_failure):
-                self.current_objective = f"resolve {event.failure_signature}"
-                self.current_subgoal = "determine whether the failure is repeating"
-            if event.topic and (event.confidence >= 0.8 or self.current_topic is None):
-                self.current_topic = event.topic
-        elif event.event_type == "documentation" and self.current_objective:
-            self.current_subgoal = "compare documentation with the current failure"
-            if event.topic:
-                self.current_topic = event.topic
+        # The reducer is the single deterministic state-transition owner.
+        observation = Observation(
+            event_type=event.event_type,
+            activity=event.activity,
+            app=event.app,
+            summary=event.summary,
+            confidence=event.confidence,
+            topic=event.topic,
+            failure_signature=event.failure_signature,
+            timestamp=getattr(event.timestamp, "isoformat", lambda: str(event.timestamp))(),
+        )
+        WorldStateReducer.apply(self, observation, allow_objective_update=allow_objective_update)
 
     def add_decision(self, decision: str) -> None:
         self.decisions.append(decision)

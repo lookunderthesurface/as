@@ -9,6 +9,7 @@ from ..context.working_state import WorkingState
 from ..inference.schema import Action
 from ..memory.intervention import PreferenceKind, PreferenceSource
 from ..perception.extractor import ExtractedEvent
+from .context import DecisionContext
 from .hard_rules import HardRules
 from .watch import WatchHypothesis, WatchManager
 
@@ -103,6 +104,28 @@ class ProactivePolicy:
         preferences: Sequence[Mapping[str, object]] = (),
         similar_episodes: Sequence[Mapping[str, object]] = (),
     ) -> Decision:
+        """Decide from an event. Equivalent to ``decide_context`` with defaults."""
+        context = DecisionContext(
+            event=event,
+            working_state=state,
+            now=now,
+            failure_count=failure_count,
+            activation_failure_count=failure_count,
+            active_watch=self.watch.active,
+            watch_snapshot=tuple(self.watch.snapshot()),
+            preferences=tuple(preferences),
+            similar_episodes=tuple(similar_episodes),
+        )
+        return self.decide_context(context)
+
+    def decide_context(self, context: DecisionContext) -> Decision:
+        """The policy-complete decision entry point used by the engine."""
+        event = context.event
+        state = context.working_state
+        now = context.now
+        preferences = context.preferences
+        similar_episodes = context.similar_episodes
+        failure_count = context.failure_count
         self.watch.expire(now)
         candidate = event.candidate_action
         deterministic_evidence = failure_count if event.failure_signature else 0
