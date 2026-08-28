@@ -54,6 +54,8 @@ class SecretaryController:
         self._capture_worker: Thread | None = None
         self._inference_worker: Thread | None = None
         self._worker_error: str | None = None
+        self._generation = 0
+        self._generation_lock = Lock()
         self._async_runtime = all(
             callable(getattr(self.engine, name, None))
             for name in ("prepare_inference_batch", "submit_inference", "run_scheduled_inference")
@@ -71,6 +73,8 @@ class SecretaryController:
             with self._latest_lock:
                 self._latest_batch = None
             self._worker_error = None
+            with self._generation_lock:
+                self._generation = 0
             if self.lifecycle is not None:
                 self.lifecycle.start()
             if self._async_runtime:
@@ -173,6 +177,13 @@ class SecretaryController:
                 try:
                     items = [dict(item) for item in self.capture.poll()]  # type: ignore[attr-defined]
                     if self._async_runtime:
+                        if items:
+                            with self._generation_lock:
+                                self._generation += 1
+                                generation = self._generation
+                            note_generation = getattr(self.engine, "note_generation", None)
+                            if callable(note_generation):
+                                note_generation(generation, items)
                         self._publish_latest(items)
                     else:
                         process_batch = getattr(self.engine, "process_coalesced", None)

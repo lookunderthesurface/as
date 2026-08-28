@@ -1,0 +1,9 @@
+# Safe offline development profile. Capture/inference boundaries stay explicit.
+capture_provider: mock
+inference_provider: mock
+cloud_provider: mock
+shadow_mode: false
+ollama_text_model: qwen3-vl:2b-instruct-q4_K_M
+ollama_vision_model: qwen3-vl:2b-instruct-q4_K_M
+send_screenshots_to_cloud: false
+

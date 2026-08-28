@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Sequence
 
+from .paths import AppPaths
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCREENPIPE_VERSION = "0.4.41"
@@ -47,6 +49,8 @@ class SecretaryConfig:
     inference_min_interval_seconds: float = 10.0
     inference_max_pending_requests: int = 1
     inference_stale_request_seconds: float = 30.0
+    inference_stale_result_seconds: float = 30.0
+    inference_stale_result_generation_gap: int = 2
     inference_vision_cooldown_seconds: float = 30.0
     inference_max_text_chars: int = 6000
     ollama_base_url: str = "http://127.0.0.1:11434"
@@ -80,12 +84,27 @@ class SecretaryConfig:
     model_notify_min_interrupt_score: float = 0.70
     model_notify_min_watch_evidence: int = 2
     shadow_mode: bool = False
+    decision_retention_days: int = 30
+    session_retention_days: int = 90
+
+    @property
+    def paths(self) -> AppPaths:
+        return AppPaths(
+            project_root=self.project_root,
+            source_root=self.project_root,
+            runtime_root=self.database_path.parent.parent if self.database_path.parent.name == "data" else self.database_path.parent,
+            data_dir=self.database_path.parent,
+            database_path=self.database_path,
+            log_directory=self.log_directory,
+            prompt_directory=self.project_root / "prompts",
+        )
 
     @classmethod
     def from_environment(cls, project_root: Path | None = None) -> "SecretaryConfig":
         root = project_root or PROJECT_ROOT
-        database = Path(os.getenv("SECRETARY_DB_PATH", str(root / "data" / "state.db")))
-        log_directory = Path(os.getenv("SECRETARY_LOG_DIR", str(root / "logs")))
+        paths = AppPaths.from_environment(project_root)
+        database = Path(os.getenv("SECRETARY_DB_PATH", str(paths.database_path)))
+        log_directory = Path(os.getenv("SECRETARY_LOG_DIR", str(paths.log_directory)))
         try:
             max_notifications = max(1, int(os.getenv("SECRETARY_MAX_NOTIFICATIONS_PER_HOUR", "2")))
         except ValueError:
@@ -122,6 +141,14 @@ class SecretaryConfig:
             inference_stale = max(0.0, float(os.getenv("INFERENCE_STALE_REQUEST_SECONDS", "30")))
         except ValueError:
             inference_stale = 30.0
+        try:
+            inference_stale_result = max(0.0, float(os.getenv("INFERENCE_STALE_RESULT_SECONDS", "30")))
+        except ValueError:
+            inference_stale_result = 30.0
+        try:
+            inference_stale_generation_gap = max(1, int(os.getenv("INFERENCE_STALE_RESULT_GENERATION_GAP", "2")))
+        except ValueError:
+            inference_stale_generation_gap = 2
         try:
             vision_cooldown = max(0.0, float(os.getenv("VISION_COOLDOWN_SECONDS", "30")))
         except ValueError:
@@ -161,6 +188,14 @@ class SecretaryConfig:
         except ValueError:
             notify_watch_evidence = 2
         excluded_apps = _csv(os.getenv("SECRETARY_EXCLUDED_APPS"), DEFAULT_EXCLUDED_APPS)
+        try:
+            decision_retention_days = max(1, int(os.getenv("SECRETARY_DECISION_RETENTION_DAYS", "30")))
+        except ValueError:
+            decision_retention_days = 30
+        try:
+            session_retention_days = max(1, int(os.getenv("SECRETARY_SESSION_RETENTION_DAYS", "90")))
+        except ValueError:
+            session_retention_days = 90
         return cls(
             project_root=root,
             screenpipe_base_url=os.getenv("SCREENPIPE_BASE_URL", "http://127.0.0.1:3030").rstrip("/"),
@@ -172,6 +207,8 @@ class SecretaryConfig:
             inference_min_interval_seconds=inference_min_interval,
             inference_max_pending_requests=inference_max_pending,
             inference_stale_request_seconds=inference_stale,
+            inference_stale_result_seconds=inference_stale_result,
+            inference_stale_result_generation_gap=inference_stale_generation_gap,
             inference_vision_cooldown_seconds=vision_cooldown,
             inference_max_text_chars=max_text_chars,
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
@@ -205,12 +242,13 @@ class SecretaryConfig:
             model_notify_min_watch_evidence=notify_watch_evidence,
             shadow_mode=os.getenv("SECRETARY_SHADOW_MODE", "false").strip().lower() in {"1", "true", "yes", "on"},
             send_screenshots_to_cloud=False,
+            decision_retention_days=decision_retention_days,
+            session_retention_days=session_retention_days,
         )
 
 
 def ensure_project_dirs(config: SecretaryConfig) -> None:
-    config.database_path.parent.mkdir(parents=True, exist_ok=True)
-    config.log_directory.mkdir(parents=True, exist_ok=True)
+    config.paths.ensure()
 
 
 def resolve_launcher(command: Sequence[str]) -> str | None:

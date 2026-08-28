@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping
+from uuid import uuid4
 
 from ..events.schema import NormalizedEvent
 from .metrics import InferenceMetrics
@@ -36,6 +38,14 @@ class InferenceRequest:
     image_path: str | None = None
     use_vision: bool = False
     context_text: str = ""
+    request_id: str = field(default_factory=lambda: uuid4().hex)
+    generation_id: int = 0
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    activity_snapshot: tuple[str, ...] = ()
+    topic_snapshot: str | None = None
+    context_chars: int = 0
+    context_event_count: int = 0
+    context_watch_count: int = 0
 
 
 @dataclass(frozen=True)

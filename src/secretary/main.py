@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .capture.lifecycle import ScreenpipeLifecycleManager
+from .benchmark import run_benchmark
 from .capture.mock import MockCaptureProvider
 from .capture.screenpipe import ScreenpipeCaptureProvider
 from .config import SecretaryConfig, ensure_project_dirs, resolve_launcher
@@ -21,6 +22,7 @@ from .inference.image import ImagePreprocessor
 from .inference.ollama import OllamaInferenceProvider
 from .inference.schema import InferenceRequest
 from .inference.status import InferenceRuntimeState, LocalInferenceStatus
+from .instance import InstanceLock
 from .memory.store import MemoryStore
 from .notifications.mock import MockNotificationProvider
 from .notifications.shadow import ShadowNotificationProvider
@@ -83,6 +85,7 @@ def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout)
             return 0
         duration = float(report["duration_seconds"])
         print(f"\nSession: {report['session_id']}", file=output)
+        print(f"Status: {report.get('status', 'UNKNOWN')}", file=output)
         print(f"Duration: {int(duration // 60):02d}:{int(duration % 60):02d}", file=output)
         print(f"Screenpipe events: {report['screenpipe_events']}", file=output)
         print(f"Semantic inference requests: {report['semantic_inference_requests']}", file=output)
@@ -103,6 +106,22 @@ def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout)
         p95 = report["p95_latency_ms"]
         print(f"\nAverage inference latency: {average:.1f} ms" if average is not None else "\nAverage inference latency: n/a", file=output)
         print(f"P95 inference latency: {p95:.1f} ms" if p95 is not None else "P95 inference latency: n/a", file=output)
+        counters = report.get("counters", {})
+        if counters:
+            print("\nRuntime funnel:", file=output)
+            for name in (
+                "raw_screenpipe_items", "normalized_events", "privacy_filtered_events",
+                "duplicate_events_dropped", "coalesced_batches", "inference_submitted",
+                "inference_replaced", "inference_results_received", "inference_results_stale_discarded",
+                "policy_ignore", "policy_remember", "policy_watch", "policy_investigate",
+                "policy_notify_candidate", "policy_ask_cloud", "would_notify", "real_notify",
+            ):
+                if counters.get(name, 0):
+                    print(f"{name}: {counters[name]}", file=output)
+        print("\nLatency distribution:", file=output)
+        for mode, stats in report.get("latency", {}).items():
+            if stats.get("count"):
+                print(f"{mode}: count={stats['count']} median={stats['median_ms']:.1f}ms p90={stats['p90_ms']:.1f}ms p95={stats['p95_ms']:.1f}ms max={stats['max_ms']:.1f}ms", file=output)
         return 0
     finally:
         store.close()
@@ -114,11 +133,11 @@ def _print_action_counts(counts: dict[str, int], output) -> None:
             print(f"{action:<13}{counts[action]}", file=output)
 
 
-def run_recent_decisions(config: SecretaryConfig | None = None, limit: int = 20, output=sys.stdout) -> int:
+def run_recent_decisions(config: SecretaryConfig | None = None, limit: int = 20, output=sys.stdout, *, action: str | None = None, suppressed: bool = False) -> int:
     config = config or SecretaryConfig.from_environment()
     store = MemoryStore(config.database_path)
     try:
-        traces = list(reversed(store.recent_decision_traces(limit)))
+        traces = list(reversed(store.recent_decision_traces(limit, action=action, suppressed=suppressed)))
         print("Ambient Secretary Recent Decisions", file=output)
         if not traces:
             print("\nNo decision traces recorded.", file=output)
@@ -130,6 +149,7 @@ def run_recent_decisions(config: SecretaryConfig | None = None, limit: int = 20,
             print(f"Event: {trace['event_type']}", file=output)
             print(f"Model: {trace['candidate_action']}", file=output)
             print(f"Final: {trace['final_action']}", file=output)
+            print(f"reason_code={trace.get('reason_code', 'POLICY_IGNORE')}", file=output)
             print(f"confidence={float(trace['candidate_confidence']):.2f} importance={float(trace['candidate_importance']):.2f} interrupt={float(trace['interrupt_score']):.2f}", file=output)
             print(f"deterministic_evidence={trace['deterministic_evidence']} watch_evidence={trace['watch_evidence']}", file=output)
             if trace["suppression_reason"]:
@@ -174,7 +194,9 @@ def run_preflight(config: SecretaryConfig | None = None, output=sys.stdout) -> b
             ("OK", "Managed Screenpipe excluded windows configured", (not config.excluded_apps) or "--ignored-windows" in config.screenpipe_command, managed, ",".join(config.excluded_apps)),
         ])
         provider = ScreenpipeCaptureProvider(config.screenpipe_base_url, config.screenpipe_api_key)
-        healthy = provider.health()
+        # Without credentials there is no useful authenticated readiness check;
+        # avoid even a localhost probe in the portable/unit path.
+        healthy = provider.health() if key_available else False
         authenticated = provider.authenticated_search(limit=1) if healthy and key_available else False
         if healthy and authenticated:
             checks.append(("OK", "Screenpipe currently running", True, False, "health + authenticated search"))
@@ -330,6 +352,17 @@ def _sqlite_check() -> bool:
 
 
 def run_live(config: SecretaryConfig, args: argparse.Namespace) -> int:
+    lock = InstanceLock(config.paths.runtime_root / "secretary.lock")
+    if not lock.acquire():
+        print("Another Ambient Secretary instance is already running.")
+        return 2
+    try:
+        return _run_live_unlocked(config, args)
+    finally:
+        lock.release()
+
+
+def _run_live_unlocked(config: SecretaryConfig, args: argparse.Namespace) -> int:
     mock_capture = args.mock_capture or config.capture_provider == "mock"
     shadow = bool(getattr(args, "shadow", False) or config.shadow_mode)
     if shadow:
@@ -422,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     replay = sub.add_parser("replay", help="replay a deterministic JSONL scenario")
     replay.add_argument("scenario", type=Path)
     sub.add_parser("preflight", help="check development and real-capture readiness")
+    sub.add_parser("doctor", help="offline diagnostics for local dependencies and configuration")
     status_parser = sub.add_parser("inference-status", help="show configured local inference")
     status_parser.add_argument("--probe", action="store_true", help="explicitly query Ollama version, tags, and configured model")
     smoke = sub.add_parser("inference-smoke", help="run one explicit local Ollama inference without Screenpipe")
@@ -442,6 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("session-report", help="show the latest bounded session decision report")
     recent = sub.add_parser("recent-decisions", help="show recent bounded decision traces")
     recent.add_argument("--limit", type=int, default=20)
+    recent.add_argument("--action", choices=("IGNORE", "REMEMBER", "WATCH", "INVESTIGATE", "ASK_CLOUD", "NOTIFY", "WOULD_NOTIFY"))
+    recent.add_argument("--suppressed", action="store_true")
+    sub.add_parser("benchmark", help="run the deterministic ten-scenario CPU benchmark")
     return parser
 
 
@@ -450,7 +487,7 @@ def main(argv: list[str] | None = None) -> None:
     config = SecretaryConfig.from_environment()
     if args.command == "replay":
         raise SystemExit(run_replay(args.scenario, config))
-    if args.command == "preflight":
+    if args.command in {"preflight", "doctor"}:
         raise SystemExit(0 if run_preflight(config) else 1)
     if args.command == "inference-status":
         raise SystemExit(run_inference_status(config, probe=args.probe))
@@ -459,7 +496,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "session-report":
         raise SystemExit(run_session_report(config))
     if args.command == "recent-decisions":
-        raise SystemExit(run_recent_decisions(config, limit=args.limit))
+        raise SystemExit(run_recent_decisions(config, limit=args.limit, action=args.action, suppressed=args.suppressed))
+    if args.command == "benchmark":
+        raise SystemExit(run_benchmark(config))
     if args.command == "run":
         raise SystemExit(run_live(config, args))
 

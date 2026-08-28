@@ -30,9 +30,22 @@ class MockInferenceProvider:
         app_lower = app.casefold()
         text_lower = event.text.casefold()
         haystack = f"{app_lower} {event.window_title.casefold()} {text_lower}"
+        browser_like = any(token in haystack for token in ("chrome", "edge", "firefox", "documentation", "docs", "stackoverflow", "github"))
+        terminal_like = not browser_like and any(token in haystack for token in ("terminal", "powershell", "cmd.exe", "bash", "shell"))
+        if terminal_like and any(token in haystack for token in ("passed", "success", "successful", "fixed", "resolved", "green")):
+            return self._result(
+                event_type="recovery",
+                activity="terminal",
+                summary="A previously failing command appears to have recovered",
+                importance=0.62,
+                novelty=0.55,
+                confidence=0.92,
+                candidate_action=Action.IGNORE,
+                reason="Recovery evidence should close a matching watch",
+            )
         signature = self._failure_signature(haystack)
         if signature:
-            activity = "terminal" if any(token in haystack for token in ("terminal", "powershell", "cmd.exe", "bash", "shell")) else "coding"
+            activity = "terminal" if terminal_like else "coding"
             return self._result(
                 event_type="failure",
                 activity=activity,
@@ -119,7 +132,15 @@ class MockInferenceProvider:
         )
 
     def _failure_signature(self, haystack: str) -> str | None:
-        kind = next((value for term, value in self._failure_terms if term in haystack), None)
+        browser_like = any(token in haystack for token in ("chrome", "edge", "firefox", "documentation", "docs", "stackoverflow", "github"))
+        terminal_like = not browser_like and any(token in haystack for token in ("terminal", "powershell", "cmd.exe", "bash", "shell"))
+        kind = None
+        for term, value in self._failure_terms:
+            if term == "error" and not terminal_like:
+                continue
+            if term in haystack:
+                kind = value
+                break
         if kind is None:
             return None
         ecosystem = "python" if any(term in haystack for term in ("pytest", "python", "traceback")) else "node" if any(term in haystack for term in ("npm", "node", "javascript")) else "general"

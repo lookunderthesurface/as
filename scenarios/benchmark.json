@@ -1,0 +1,14 @@
+{
+  "scenarios": [
+    {"name": "normal_coding", "file": "01_normal_coding.jsonl", "forbidden": ["NOTIFY"]},
+    {"name": "repeated_failure", "file": "02_repeated_failure.jsonl", "expected_any": ["NOTIFY"]},
+    {"name": "cross_app_debug", "file": "03_cross_app_debug.jsonl", "forbidden": ["NOTIFY"]},
+    {"name": "documentation_research", "file": "04_documentation_research.jsonl", "forbidden": ["NOTIFY"]},
+    {"name": "context_switch", "file": "05_context_switch.jsonl", "forbidden": ["NOTIFY"]},
+    {"name": "false_positive_trap", "file": "06_false_positive_trap.jsonl", "forbidden": ["NOTIFY", "WATCH", "INVESTIGATE"]},
+    {"name": "stale_result_fixture", "file": "07_stale_result.jsonl", "forbidden": ["NOTIFY"]},
+    {"name": "privacy_excluded_app", "file": "08_privacy_excluded_app.jsonl", "forbidden": ["NOTIFY"], "expect_privacy": true},
+    {"name": "visual_required", "file": "09_visual_required.jsonl", "forbidden": ["NOTIFY"]},
+    {"name": "recovered_problem", "file": "10_recovered_problem.jsonl", "forbidden": ["NOTIFY"]}
+  ]
+}

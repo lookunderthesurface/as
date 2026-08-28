@@ -1,0 +1,11 @@
+# Opt-in evaluation profile. This file does not install drivers, CUDA, or models.
+capture_provider: screenpipe
+screenpipe_mode: managed
+inference_provider: ollama
+cloud_provider: mock
+shadow_mode: true
+ollama_text_model: qwen3-vl:2b-instruct-q4_K_M
+ollama_vision_model: qwen3-vl:2b-instruct-q4_K_M
+ollama_think: false
+send_screenshots_to_cloud: false
+

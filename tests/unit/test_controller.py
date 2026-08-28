@@ -129,6 +129,10 @@ class ControllerTests(unittest.TestCase):
                 self.started = Event()
                 self.release = Event()
                 self.completed: list[str] = []
+                self.generations: list[int] = []
+
+            def note_generation(self, generation, items):
+                self.generations.append(generation)
 
             def prepare_inference_batch(self, items):
                 text = items[-1]["text"]
@@ -163,6 +167,8 @@ class ControllerTests(unittest.TestCase):
         try:
             self.assertTrue(engine.started.wait(1))
             self.assertTrue(self._wait_for(lambda: capture.poll_calls >= 6))
+            self.assertTrue(engine.generations)
+            self.assertEqual(engine.generations, list(range(1, len(engine.generations) + 1)))
             engine.release.set()
             self.assertTrue(self._wait_for(lambda: len(engine.completed) >= 2))
             self.assertEqual(engine.completed[:2], ["A", "F"])

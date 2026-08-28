@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-28T11:50:00Z","foreground_app":"KeePass.exe","window_title":"Password Database","event_source":"window_focus","text":"secret password content must never be stored"}
+{"timestamp":"2026-08-28T11:50:40Z","foreground_app":"Code.exe","window_title":"editor","event_source":"typing","text":"editing"}

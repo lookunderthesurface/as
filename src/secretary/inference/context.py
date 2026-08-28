@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
 from time import monotonic
+from uuid import uuid4
 from collections.abc import Callable
 
 from ..events.schema import NormalizedEvent
@@ -27,6 +29,11 @@ class InferenceContextBuilder:
         recent_assistant_decisions: Iterable[str] = (),
         image_path: str | None = None,
         use_vision: bool | None = None,
+        request_id: str | None = None,
+        generation_id: int = 0,
+        created_at: datetime | None = None,
+        activity_snapshot: tuple[str, ...] | None = None,
+        topic_snapshot: str | None = None,
     ) -> InferenceRequest:
         vision = self.vision_gate.allow(current_event) if use_vision is None else bool(use_vision)
         recent_events_tuple = tuple(recent_events)
@@ -51,6 +58,14 @@ class InferenceContextBuilder:
             image_path=image_path if vision else None,
             use_vision=vision,
             context_text=text,
+            request_id=request_id or uuid4().hex,
+            generation_id=max(0, int(generation_id)),
+            created_at=created_at or datetime.now(timezone.utc),
+            activity_snapshot=activity_snapshot or (current_event.foreground_app, current_event.event_source, current_event.window_title),
+            topic_snapshot=topic_snapshot,
+            context_chars=len(text),
+            context_event_count=len(recent_events_tuple),
+            context_watch_count=len(hypotheses_tuple),
         )
 
     def _render(

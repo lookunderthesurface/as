@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ..perception.extractor import ExtractedEvent
 
@@ -22,6 +22,7 @@ class WatchHypothesis:
     expires_at: datetime
     last_reason: str
     updated_at: datetime | None = None
+    status: str = "ACTIVE"
 
     @property
     def reason(self) -> str:
@@ -42,6 +43,7 @@ class WatchHypothesis:
             "expires_at": self.expires_at.isoformat(),
             "reason": self.reason,
             "last_reason": self.last_reason,
+            "status": self.status,
         }
 
 
@@ -51,6 +53,8 @@ class WatchManager:
         self.max_active_hypotheses = max(1, max_active_hypotheses)
         self._hypotheses: list[WatchHypothesis] = []
         self._active_signature: str | None = None
+        self._history: list[WatchHypothesis] = []
+        self._resolved_at: dict[str, datetime] = {}
 
     @property
     def active(self) -> WatchHypothesis | None:
@@ -62,11 +66,47 @@ class WatchManager:
 
     def expire(self, now: datetime) -> bool:
         before = len(self._hypotheses)
-        self._hypotheses = [item for item in self._hypotheses if now < item.expires_at]
+        remaining: list[WatchHypothesis] = []
+        for item in self._hypotheses:
+            if now < item.expires_at:
+                remaining.append(item)
+            else:
+                item.status = "EXPIRED"
+                self._history.append(item)
+        self._hypotheses = remaining
         expired = len(self._hypotheses) != before
         if self._active_signature and not any(item.signature == self._active_signature for item in self._hypotheses):
             self._active_signature = self._hypotheses[-1].signature if self._hypotheses else None
         return expired
+
+    def resolve(self, event_or_signature: ExtractedEvent | str | None, now: datetime, reason: str = "recovery observed") -> bool:
+        """Close an active watch when a matching recovery is observed."""
+        signature = event_or_signature.failure_signature if isinstance(event_or_signature, ExtractedEvent) else event_or_signature
+        if not signature:
+            active = self.active
+            signature = active.signature if active else None
+        self.expire(now)
+        matches = [item for item in self._hypotheses if signature is None or item.signature == signature]
+        if not matches:
+            return False
+        resolved_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        for item in matches:
+            item.status = "RESOLVED"
+            item.last_reason = _clean(reason, 300) or "recovery observed"
+            item.updated_at = resolved_at
+            self._resolved_at[item.signature] = resolved_at
+            self._history.append(item)
+            self._hypotheses.remove(item)
+        self._active_signature = self._hypotheses[-1].signature if self._hypotheses else None
+        return True
+
+    def resolved_at(self, signature: str | None) -> datetime | None:
+        if not signature:
+            return None
+        return self._resolved_at.get(signature)
+
+    def history(self) -> list[dict[str, object]]:
+        return [item.as_dict() for item in self._history[-20:]]
 
     def _find(self, signature: str) -> WatchHypothesis | None:
         return next((item for item in self._hypotheses if item.signature == signature), None)

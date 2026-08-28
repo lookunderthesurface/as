@@ -149,3 +149,70 @@ Reversal:
 The Secretary-owned Screenpipe process was stopped during cleanup and the
 3030 listener was absent afterward. Existing npm/Ollama caches and local
 Screenpipe runtime data were left intact for manual review/removal.
+
+### External change 007
+
+Reason:
+The project test runner was not available in the active Python environments,
+so the requested unit and replay validation could not run until a test runner
+was installed.
+
+Commands/requests:
+`py -m pip install pytest` installed pytest and its small test-runner
+dependencies into the current user Python 3.14 environment. No project
+dependency, model, Ollama runtime, Screenpipe runtime, PATH entry, or system
+configuration was changed.
+
+Impact:
+The `pytest` executable is installed under the user Python Scripts directory,
+which is not on PATH; validation invokes it as `py -m pytest`.
+
+Reversal:
+The install can be removed from the user Python environment with
+`py -m pip uninstall pytest colorama iniconfig packaging pluggy pygments` if
+desired. No project files were changed by the install.
+
+### External change 008
+
+Reason:
+The user requested final opt-in validation of the already-installed local
+Ollama runtime and the real Screenpipe shadow path.
+
+Commands/requests:
+The project queried localhost Ollama `/api/version` and `/api/tags`, ran one
+text smoke and one vision smoke with the existing
+`qwen3-vl:2b-instruct-q4_K_M`, then ran `secretary run --managed --shadow
+--mock-notifications --once` with the Screenpipe key supplied only through the
+child process environment.
+
+Impact:
+Ollama reported `0.33.1` and the configured model was available. Text and
+vision structured-output calls completed, and the short real Screenpipe run
+started the pinned cached `0.4.41` child with recorder privacy flags, then
+cleaned it up. No model pull, runtime upgrade, PATH change, cloud request, or
+real notification occurred. The 3030 listener was absent after cleanup.
+
+Reversal:
+No project or system reversal is needed. Existing Ollama/npm caches and
+Screenpipe runtime data were left untouched.
+
+### External change 009
+
+Reason:
+The user requested an opt-in managed lifecycle check when the current Windows
+environment allowed it.
+
+Command:
+`py -m unittest tests.live.test_windows_live_opt_in -v` with
+`SECRETARY_LIVE_TESTS=1` and the Screenpipe key supplied ephemerally.
+
+Impact:
+The managed real Screenpipe lifecycle test passed, including owned launch,
+authenticated search, recorder audio-disabled check, pause/resume, and cleanup.
+The external-instance case was correctly skipped because no external instance
+was running. The 3030 listener was absent after cleanup. No model, version,
+PATH, cloud, or system configuration was changed.
+
+Reversal:
+The owned Screenpipe child was stopped by the test's ownership cleanup; npm and
+Screenpipe runtime caches/data were left untouched.

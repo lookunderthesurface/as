@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-28T12:10:00Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest FAILED"}
+{"timestamp":"2026-08-28T12:10:40Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest FAILED"}
+{"timestamp":"2026-08-28T12:11:20Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest PASSED after fix; resolved"}

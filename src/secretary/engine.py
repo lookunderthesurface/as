@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 from .capture.screenpipe import ScreenpipeCaptureProvider
 from .config import SecretaryConfig, ensure_project_dirs
@@ -25,12 +25,14 @@ from .inference.mock import MockInferenceProvider
 from .inference.ollama import OllamaInferenceProvider
 from .inference.scheduler import InferenceScheduler
 from .inference.schema import InferenceRequest
+from .inference.stale import ResultFreshness, assess_result
 from .inference.status import InferenceRuntimeState, LocalInferenceStatus
 from .perception.extractor import ExtractedEvent, EventExtractor
 from .policy.hard_rules import HardRules
 from .policy.proactive import Action, Decision, PolicyThresholds, ProactivePolicy
 from .policy.watch import WatchManager
 from .privacy.filter import PrivacyFilter
+from .runtime import RuntimeCounters
 
 
 @dataclass
@@ -61,6 +63,11 @@ class SecretaryEngine:
         ensure_project_dirs(self.config)
         self.store = store or MemoryStore(self.config.database_path)
         self.notifier = notifier or MockNotificationProvider()
+        self.counters = RuntimeCounters()
+        self._generation_lock = Lock()
+        self._current_generation = 0
+        self._current_activity: tuple[str, ...] = ()
+        self._current_topic: str | None = None
         if inference_provider is not None:
             self.inference = inference_provider
         elif self.config.inference_provider == "mock":
@@ -85,7 +92,10 @@ class SecretaryEngine:
         else:
             raise RuntimeError(f"cloud provider is not implemented: {self.config.cloud_provider}")
         self.session = SessionState()
-        self.session_id = self.store.start_session()
+        self.session_id = self.store.start_session(
+            decision_retention_days=self.config.decision_retention_days,
+            session_retention_days=self.config.session_retention_days,
+        )
         self._closed = False
         self.state = WorkingState()
         self.filter = MeaningfulEventFilter()
@@ -130,7 +140,7 @@ class SecretaryEngine:
         if self._closed:
             return
         self._closed = True
-        self.store.end_session(self.session_id)
+        self.store.end_session(self.session_id, {"counters": self.counters.snapshot()})
         self.store.close()
         close_logger(self.logger)
 
@@ -148,15 +158,18 @@ class SecretaryEngine:
 
     def process(self, raw: dict[str, object]) -> ProcessResult:
         if self.session.paused:
-            decision = Decision(Action.IGNORE, "paused")
+            decision = Decision(Action.IGNORE, "paused", reason_code="PAUSED")
             return ProcessResult(decision)
         event = normalize_fixture_item(raw)
+        self._count_raw_and_normalized(raw)
         privacy = self.privacy.check(event)
         if privacy.blocked:
+            self.counters.increment("privacy_filtered_events")
             self.logger.info("event_type=privacy-suppressed app_category=excluded policy=IGNORE")
-            return ProcessResult(Decision(Action.IGNORE, "privacy excluded app"), privacy_suppressed=True)
+            return ProcessResult(Decision(Action.IGNORE, "privacy excluded app", reason_code="PRIVACY_FILTERED"), privacy_suppressed=True)
         if not self.filter.accept(event):
-            return ProcessResult(Decision(Action.IGNORE, "duplicate capture frame"))
+            self.counters.increment("duplicate_events_dropped")
+            return ProcessResult(Decision(Action.IGNORE, "duplicate capture frame", reason_code="DUPLICATE_DROPPED"))
         self.coalescer.add(event)
         request = self.context_builder.build(
             event,
@@ -166,9 +179,17 @@ class SecretaryEngine:
             recent_failures=self.state.recent_failures,
             recent_assistant_decisions=self.state.decisions,
             image_path=event.image_path,
+            generation_id=self._generation_value(),
+            topic_snapshot=self.state.current_topic or self.state.current_objective,
         )
         extracted = self.extractor.extract(event, request)
-        return self._apply_extracted(event, extracted, inference_mode="vision" if request.use_vision else "text")
+        if request.use_vision:
+            self.counters.increment("vision_inference_calls")
+        else:
+            self.counters.increment("text_inference_calls")
+        self._record_inference_result()
+        self.counters.increment("inference_results_received")
+        return self._apply_extracted(event, extracted, inference_mode="vision" if request.use_vision else "text", request=request)
 
     def process_coalesced(self, raws: list[dict[str, object]]) -> list[ProcessResult]:
         """Process one capture poll synchronously for replay and unit callers."""
@@ -176,24 +197,35 @@ class SecretaryEngine:
         if work is None:
             return results
         extracted = self.extractor.extract(work.event, work.request)
-        results.append(self._apply_extracted(work.event, extracted, inference_mode="vision" if work.request.use_vision else "text"))
+        if work.request.use_vision:
+            self.counters.increment("vision_inference_calls")
+        else:
+            self.counters.increment("text_inference_calls")
+        self._record_inference_result()
+        self.counters.increment("inference_results_received")
+        results.append(self._apply_extracted(work.event, extracted, inference_mode="vision" if work.request.use_vision else "text", request=work.request))
         return results
 
     def prepare_inference_batch(self, raws: list[dict[str, object]]) -> tuple[list[ProcessResult], InferenceWork | None]:
         """Prepare one bounded request without calling a provider or mutating policy state."""
         if self.session.paused:
-            return [ProcessResult(Decision(Action.IGNORE, "paused")) for _ in raws], None
+            return [ProcessResult(Decision(Action.IGNORE, "paused", reason_code="PAUSED")) for _ in raws], None
         accepted: list[NormalizedEvent] = []
         results: list[ProcessResult] = []
+        if any(_is_screenpipe_raw(raw) for raw in raws):
+            self.counters.increment("raw_screenpipe_items", len(raws))
         for raw in raws:
             event = normalize_fixture_item(raw)
+            self.counters.increment("normalized_events")
             privacy = self.privacy.check(event)
             if privacy.blocked:
+                self.counters.increment("privacy_filtered_events")
                 self.logger.info("event_type=privacy-suppressed app_category=excluded policy=IGNORE")
-                results.append(ProcessResult(Decision(Action.IGNORE, "privacy excluded app"), privacy_suppressed=True))
+                results.append(ProcessResult(Decision(Action.IGNORE, "privacy excluded app", reason_code="PRIVACY_FILTERED"), privacy_suppressed=True))
                 continue
             if not self.filter.accept(event):
-                results.append(ProcessResult(Decision(Action.IGNORE, "duplicate capture frame")))
+                self.counters.increment("duplicate_events_dropped")
+                results.append(ProcessResult(Decision(Action.IGNORE, "duplicate capture frame", reason_code="DUPLICATE_DROPPED")))
                 continue
             accepted.append(event)
         accepted.sort(key=lambda item: (item.timestamp, item.stable_id))
@@ -201,6 +233,7 @@ class SecretaryEngine:
             self.coalescer.add(event)
         if not accepted:
             return results, None
+        self.counters.increment("coalesced_batches")
         event = accepted[-1]
         request = self.context_builder.build(
             event,
@@ -210,27 +243,57 @@ class SecretaryEngine:
             recent_failures=self.state.recent_failures,
             recent_assistant_decisions=self.state.decisions,
             image_path=event.image_path,
+            generation_id=self._generation_value(),
+            topic_snapshot=self.state.current_topic or self.state.current_objective,
         )
         return results, InferenceWork(event=event, request=request)
 
     def submit_inference(self, work: InferenceWork) -> None:
         """Replace the bounded pending request with the newest prepared state."""
+        if self.scheduler.pending_request is not None:
+            self.counters.increment("inference_replaced")
         self.scheduler.submit(work.request)
+        self.counters.increment("inference_submitted")
 
     def run_scheduled_inference(self, work: InferenceWork) -> ProcessResult | None:
         """Run one admitted request and apply policy on this single worker."""
+        discarded_before = self.scheduler.discarded_stale_requests
         request = self.scheduler.start_next()
         if request is None:
             # A stale request is removed by start_next. A throttled request
             # remains pending and the controller will retry after the interval.
+            if self.scheduler.discarded_stale_requests > discarded_before:
+                self.counters.increment("inference_stale_request_dropped")
             return None
+        if request.use_vision:
+            self.counters.increment("vision_inference_calls")
+        else:
+            self.counters.increment("text_inference_calls")
         try:
             extracted = self.extractor.extract(work.event, request)
-            result = None if self.session.paused else self._apply_extracted(
-                work.event,
-                extracted,
-                inference_mode="vision" if request.use_vision else "text",
+            self._record_inference_result()
+            self.counters.increment("inference_results_received")
+            assessment = assess_result(
+                request,
+                current_generation=self._generation_value(),
+                current_activity=self._activity_value(),
+                current_topic=self._topic_value(),
+                stale_seconds=self.config.inference_stale_result_seconds,
+                stale_generation_gap=self.config.inference_stale_result_generation_gap,
             )
+            if assessment.freshness == ResultFreshness.STALE:
+                self.counters.increment("inference_results_stale_discarded")
+                result = self._discard_stale_result(work.event, extracted, request, assessment)
+            elif assessment.freshness == ResultFreshness.SLIGHTLY_STALE:
+                result = self._apply_slightly_stale(work.event, extracted, request, assessment)
+            else:
+                result = None if self.session.paused else self._apply_extracted(
+                    work.event,
+                    extracted,
+                    inference_mode="vision" if request.use_vision else "text",
+                    request=request,
+                    reason_code_override=None,
+                )
         except Exception:
             self.scheduler.fail()
             raise
@@ -244,12 +307,156 @@ class SecretaryEngine:
     def cancel_pending_inference(self) -> None:
         self.scheduler.cancel_pending()
 
-    def _apply_extracted(self, event: NormalizedEvent, extracted: ExtractedEvent, *, inference_mode: str = "text") -> ProcessResult:
+    def note_generation(self, generation: int, raws: list[dict[str, object]]) -> None:
+        """Publish capture freshness metadata without touching policy or storage."""
+        events = [normalize_fixture_item(raw) for raw in raws]
+        if not events:
+            return
+        current = max(events, key=lambda item: (item.timestamp, item.stable_id))
+        with self._generation_lock:
+            if generation >= self._current_generation:
+                self._current_generation = generation
+                self._current_activity = (current.foreground_app, current.event_source, current.window_title)
+                self._current_topic = self.state.current_topic or self.state.current_objective
+
+    def counters_snapshot(self) -> dict[str, int]:
+        return self.counters.snapshot()
+
+    def _generation_value(self) -> int:
+        with self._generation_lock:
+            return self._current_generation
+
+    def _activity_value(self) -> tuple[str, ...]:
+        with self._generation_lock:
+            return self._current_activity
+
+    def _topic_value(self) -> str | None:
+        with self._generation_lock:
+            return self._current_topic
+
+    def _count_raw_and_normalized(self, raw: dict[str, object]) -> None:
+        if _is_screenpipe_raw(raw):
+            self.counters.increment("raw_screenpipe_items")
+        self.counters.increment("normalized_events")
+
+    def _record_inference_result(self) -> None:
+        result = self.extractor.last_result
+        if result is None or not result.error_type:
+            return
+        self.counters.increment("provider_failures")
+        if result.error_type in {"malformed_response", "malformed_result", "structured_output_failure"}:
+            self.counters.increment("structured_output_failures")
+
+    def _discard_stale_result(
+        self,
+        event: NormalizedEvent,
+        extracted: ExtractedEvent,
+        request: InferenceRequest,
+        assessment,
+    ) -> ProcessResult:
+        decision = Decision(
+            Action.IGNORE,
+            f"inference result discarded as {assessment.freshness.value.lower()}",
+            candidate_action=extracted.candidate_action,
+            candidate_confidence=extracted.confidence,
+            candidate_importance=extracted.importance,
+            interrupt_score=extracted.interrupt_score,
+            suppression_reason="stale_result",
+            reason_code="STALE_RESULT",
+        )
+        self.state.add_decision(decision.action.value)
+        self._record_trace(event, extracted, decision, "IGNORE", request, decision.reason_code)
+        return ProcessResult(decision, extracted)
+
+    def _apply_slightly_stale(
+        self,
+        event: NormalizedEvent,
+        extracted: ExtractedEvent,
+        request: InferenceRequest,
+        assessment,
+    ) -> ProcessResult:
+        self.state.observe(extracted, allow_objective_update=False)
+        action = Action.REMEMBER if (
+            extracted.confidence >= self.config.model_remember_min_confidence
+            and extracted.importance >= self.config.model_remember_min_importance
+        ) else Action.IGNORE
+        decision = Decision(
+            action,
+            "slightly stale result retained without escalation",
+            evidence=0,
+            candidate_action=extracted.candidate_action,
+            candidate_confidence=extracted.confidence,
+            candidate_importance=extracted.importance,
+            interrupt_score=extracted.interrupt_score,
+            suppression_reason="slightly_stale_low_risk" if action == Action.IGNORE else None,
+            reason_code="SLIGHTLY_STALE_LOW_RISK",
+        )
+        self.store.record_event(extracted, source=event.source, session_id=self.session_id)
+        self.state.add_decision(action.value)
+        self.counters.increment(f"policy_{action.value.casefold()}")
+        if action == Action.REMEMBER:
+            self.store.record_memory(extracted.summary, importance=extracted.importance, tags=extracted.failure_signature or "")
+        self._record_trace(event, extracted, decision, action.value, request, decision.reason_code)
+        return ProcessResult(decision, extracted)
+
+    def _record_trace(
+        self,
+        event: NormalizedEvent,
+        extracted: ExtractedEvent,
+        decision: Decision,
+        final_action: str,
+        request: InferenceRequest | None,
+        reason_code: str,
+    ) -> None:
+        result = self.extractor.last_result
+        metrics = result.metrics if result is not None else None
+        self.store.record_decision_trace(
+            session_id=self.session_id,
+            event_timestamp=event.timestamp,
+            foreground_app=event.foreground_app,
+            event_type=extracted.event_type,
+            candidate_action=extracted.candidate_action.value,
+            candidate_confidence=extracted.confidence,
+            candidate_importance=extracted.importance,
+            interrupt_score=extracted.interrupt_score,
+            deterministic_evidence=decision.deterministic_evidence,
+            watch_id=decision.watch_id,
+            watch_evidence=decision.watch_evidence,
+            policy_action=decision.action.value,
+            final_action=final_action,
+            suppression_reason=decision.suppression_reason,
+            inference_latency_ms=metrics.wall_latency_ms if metrics is not None else None,
+            inference_mode=metrics.mode if metrics is not None else ("vision" if request and request.use_vision else "text"),
+            reason=decision.reason,
+            summary=extracted.summary,
+            cloud_escalation_candidate=decision.cloud_escalation_candidate,
+            reason_code=reason_code,
+            context_chars=request.context_chars if request is not None else 0,
+            context_event_count=request.context_event_count if request is not None else 0,
+            context_watch_count=request.context_watch_count if request is not None else 0,
+        )
+
+    def _apply_extracted(
+        self,
+        event: NormalizedEvent,
+        extracted: ExtractedEvent,
+        *,
+        inference_mode: str = "text",
+        request: InferenceRequest | None = None,
+        reason_code_override: str | None = None,
+    ) -> ProcessResult:
         self.state.observe(extracted)
-        failure_count = self.store.count_failures(extracted.failure_signature) if extracted.failure_signature else 0
+        resolved_at = self.watch.resolved_at(extracted.failure_signature) if extracted.failure_signature else None
+        failure_count = self.store.count_failures(extracted.failure_signature, since=resolved_at) if extracted.failure_signature else 0
         decision = self.policy.decide(extracted, self.state, failure_count + (1 if extracted.failure_signature else 0), event.timestamp)
         self.store.record_event(extracted, source=event.source, session_id=self.session_id)
         final_action = decision.action.value
+        if decision.action.value.casefold() in {"ignore", "remember", "watch", "investigate"}:
+            self.counters.increment(f"policy_{decision.action.value.casefold()}")
+        if decision.candidate_action == Action.NOTIFY:
+            self.counters.increment("policy_notify_candidate")
+        if decision.candidate_action == Action.ASK_CLOUD:
+            self.counters.increment("policy_ask_cloud")
         self.state.add_decision(final_action)
         if decision.action == Action.REMEMBER:
             self.store.record_memory(extracted.summary, importance=extracted.importance, tags=extracted.failure_signature or "")
@@ -265,8 +472,10 @@ class SecretaryEngine:
                 self.notifier.notify(title, body)
                 if not shadow_notification:
                     self.hard_rules.mark_notified(extracted, event.timestamp)
+                    self.counters.increment("real_notify")
                 else:
                     final_action = "WOULD_NOTIFY"
+                    self.counters.increment("would_notify")
                 self.store.record_notification(title, body, final_action)
             except Exception as exc:
                 self.logger.warning("event_type=notification_error error_class=%s", exc.__class__.__name__)
@@ -313,8 +522,16 @@ class SecretaryEngine:
             reason=decision.reason,
             summary=extracted.summary,
             cloud_escalation_candidate=decision.cloud_escalation_candidate,
+            reason_code=reason_code_override or decision.reason_code,
+            context_chars=request.context_chars if request is not None else 0,
+            context_event_count=request.context_event_count if request is not None else 0,
+            context_watch_count=request.context_watch_count if request is not None else 0,
         )
         return ProcessResult(decision, extracted)
 
     def process_capture(self, provider: ScreenpipeCaptureProvider) -> list[ProcessResult]:
         return self.process_coalesced([dict(item) for item in provider.poll()])
+
+
+def _is_screenpipe_raw(raw: dict[str, object]) -> bool:
+    return raw.get("source") == "screenpipe" or "content" in raw or "type" in raw

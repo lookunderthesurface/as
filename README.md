@@ -42,6 +42,7 @@ Python or Windows. It is not required for unit tests or replay.
 
 # Check local development readiness; no token is printed
 .\.venv\Scripts\python.exe -m secretary preflight
+.\.venv\Scripts\python.exe -m secretary doctor
 
 # Show local inference configuration without probing a model runtime
 .\.venv\Scripts\python.exe -m secretary inference-status
@@ -76,6 +77,10 @@ $env:INFERENCE_PROVIDER = "ollama"
 # Bounded decision diagnostics from the latest SQLite session
 .\.venv\Scripts\python.exe -m secretary session-report
 .\.venv\Scripts\python.exe -m secretary recent-decisions --limit 20
+.\.venv\Scripts\python.exe -m secretary recent-decisions --action WOULD_NOTIFY --suppressed
+
+# Run the ten privacy-safe deterministic CPU scenarios
+.\.venv\Scripts\python.exe -m secretary benchmark
 ```
 
 Managed mode is the default. The configured command is pinned to
@@ -96,7 +101,10 @@ Windows Toast API.
 The tray UI runs its event loop on the main thread. A capture worker polls
 Screenpipe and replaces a single latest-state slot; a separate inference worker
 owns Ollama, WorkingState, Policy, and SQLite mutation. The capture worker also
-performs low-frequency process/readiness supervision (10 seconds by default). A
+performs low-frequency process/readiness supervision (10 seconds by default).
+Inference requests carry a generation, creation time, activity snapshot, and
+bounded context statistics. Results are classified as FRESH, SLIGHTLY_STALE, or
+STALE; only fresh results can escalate policy. A
 Secretary-owned child may enter `RESTARTING` and be restarted; an external
 Screenpipe instance is never started or killed and is reported as `DEGRADED` if
 it stops responding. `--tray` enables the optional real system tray shell.
@@ -176,12 +184,18 @@ package is created by the project. The optional package cache entry mentioned in
 - `session-report` and `recent-decisions` expose only bounded metadata (app,
   event type, candidate/final action, scores, evidence, suppression, and latency).
   They do not print full OCR, prompts, screenshots, passwords, or tokens.
-- SQLite is stored under `data\state.db`; logs are under `logs\` and avoid tokens,
-  secrets, and raw capture text.
+- SQLite is stored under `%LOCALAPPDATA%\AmbientSecretary` for normal installed
+  runs, or under the source checkout's `data\` and `logs\` in an explicit project
+  configuration. `SECRETARY_DATA_DIR`, `SECRETARY_DB_PATH`, and
+  `SECRETARY_LOG_DIR` make the locations explicit. The schema is versioned,
+  previous active sessions are marked `ABORTED` after a crash, and bounded
+  decision/session retention never deletes semantic memories.
 
 ## Tests
 
 Tests are separated into `tests\unit`, `tests\integration`, and `tests\live`.
+The portable unit suite requires no Windows desktop, Screenpipe, network, or
+GPU. `benchmark` runs the ten CPU scenarios in `scenarios\benchmark.json`.
 Integration requires `SCREENPIPE_API_KEY`; managed lifecycle live tests require
 `SECRETARY_LIVE_TESTS=1`, the key, an interactive Windows session, and a stopped
 Screenpipe runtime. None is enabled by default. Five JSONL scenarios cover ordinary
@@ -198,5 +212,7 @@ installed by this project.
 
 On a Windows interactive session, opt in and verify the tray icon, Toast, real
 Screenpipe events, Pause/Resume, and both external-versus-managed process
-ownership paths. See [EXTERNAL_CHANGES.md](EXTERNAL_CHANGES.md) for the external
-change record.
+ownership paths. The deferred GPU-only steps are in
+[`docs\NVIDIA_WINDOWS_CHECKLIST.md`](docs/NVIDIA_WINDOWS_CHECKLIST.md) and
+[`docs\GPU_MODEL_EVALUATION.md`](docs/GPU_MODEL_EVALUATION.md). See
+[EXTERNAL_CHANGES.md](EXTERNAL_CHANGES.md) for the external change record.

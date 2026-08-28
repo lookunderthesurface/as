@@ -40,6 +40,7 @@ class Decision:
     watch_evidence: int = 0
     suppression_reason: str | None = None
     cloud_escalation_candidate: bool = False
+    reason_code: str = "POLICY_IGNORE"
 
 
 class ProactivePolicy:
@@ -62,14 +63,17 @@ class ProactivePolicy:
         active_before = self.watch.active
         working_context = self._has_working_context(state)
 
+        if event.event_type in {"recovery", "success"} and self.watch.resolve(event, now):
+            return self._decision(event, Action.IGNORE, "watched problem resolved", reason_code="WATCH_RESOLVED")
+
         # This branch is intentionally retained as the reliable baseline. The
         # model can add context, but cannot turn repeated failures into silence.
         if event.event_type == "failure" and event.failure_signature:
             if failure_count <= 1:
-                return self._decision(event, Action.REMEMBER, "first failure is worth remembering", deterministic_evidence=1)
+                return self._decision(event, Action.REMEMBER, "first failure is worth remembering", deterministic_evidence=1, reason_code="REPEATED_FAILURE_FIRST")
             if failure_count == 2:
                 self.watch.observe_failure(event, now, "second similar failure")
-                return self._decision(event, Action.WATCH, "second similar failure; continue observing", deterministic_evidence=2)
+                return self._decision(event, Action.WATCH, "second similar failure; continue observing", deterministic_evidence=2, reason_code="REPEATED_FAILURE_WATCH")
             self.watch.observe_failure(event, now, f"failure repetition #{failure_count}")
             active = self.watch.active
             evidence = active.evidence if active else 0
@@ -85,6 +89,7 @@ class ProactivePolicy:
                         deterministic_evidence=failure_count,
                         notification_title="Ambient Secretary",
                         notification_body="The same failure pattern keeps recurring. Pause for a deliberate check of the failing command and the latest change.",
+                        reason_code="REPEATED_FAILURE_NOTIFY",
                     )
                 return self._decision(
                     event,
@@ -93,6 +98,7 @@ class ProactivePolicy:
                     evidence=evidence,
                     deterministic_evidence=failure_count,
                     suppression_reason=self._suppression_code(reason),
+                    reason_code="REPEATED_FAILURE_NOTIFY_SUPPRESSED",
                 )
             return self._decision(
                 event,
@@ -100,12 +106,13 @@ class ProactivePolicy:
                 "repeated failure warrants investigation",
                 evidence=evidence,
                 deterministic_evidence=failure_count,
+                reason_code="REPEATED_FAILURE_INVESTIGATE",
             )
 
         if event.event_type == "documentation" and active_before:
             delta = self.watch.observe_related(event, now)
             if delta:
-                return self._decision(event, Action.WATCH, "related documentation adds evidence")
+                return self._decision(event, Action.WATCH, "related documentation adds evidence", reason_code="WATCH_RELATED_DOCUMENTATION")
 
         # A model WATCH is allowed to create only a bounded, expiring
         # observation hypothesis. It never produces a notification by itself.
@@ -119,13 +126,14 @@ class ProactivePolicy:
                         "model watch candidate accepted into bounded hypothesis",
                         evidence=hypothesis.evidence,
                         hypothesis=hypothesis,
+                        reason_code="MODEL_WATCH_ACCEPTED",
                     )
             if self._meaningful(event):
-                return self._decision(event, Action.REMEMBER, "low-confidence model WATCH retained as memory only")
-            return self._decision(event, Action.IGNORE, "model WATCH below watch thresholds", suppression_reason="low_watch_confidence_or_importance")
+                return self._decision(event, Action.REMEMBER, "low-confidence model WATCH retained as memory only", reason_code="MODEL_WATCH_REMEMBERED")
+            return self._decision(event, Action.IGNORE, "model WATCH below watch thresholds", suppression_reason="low_watch_confidence_or_importance", reason_code="MODEL_WATCH_SUPPRESSED")
 
         if candidate == Action.REMEMBER and self._meets_remember_threshold(event):
-            return self._decision(event, Action.REMEMBER, "meaningful model REMEMBER candidate accepted")
+            return self._decision(event, Action.REMEMBER, "meaningful model REMEMBER candidate accepted", reason_code="MODEL_REMEMBER_ACCEPTED")
 
         if candidate == Action.ASK_CLOUD:
             # Cloud remains a mock boundary. Do not call it here; retain only a
@@ -138,6 +146,7 @@ class ProactivePolicy:
                     evidence=self.watch.active.evidence,
                     suppression_reason="cloud_provider_mock",
                     cloud_escalation_candidate=True,
+                    reason_code="CLOUD_CANDIDATE_MOCK",
                 )
             return self._decision(
                 event,
@@ -145,6 +154,7 @@ class ProactivePolicy:
                 "cloud escalation candidate recorded; cloud provider is mock",
                 suppression_reason="cloud_provider_mock",
                 cloud_escalation_candidate=True,
+                reason_code="CLOUD_CANDIDATE_MOCK",
             )
 
         if candidate == Action.INVESTIGATE:
@@ -154,10 +164,11 @@ class ProactivePolicy:
                     Action.INVESTIGATE,
                     "model investigation candidate supported by active WATCH evidence",
                     evidence=self.watch.active.evidence,
+                    reason_code="MODEL_INVESTIGATE_ACCEPTED",
                 )
             if self._meaningful(event):
-                return self._decision(event, Action.REMEMBER, "model INVESTIGATE lacks active evidence; retained as memory")
-            return self._decision(event, Action.IGNORE, "model INVESTIGATE lacks active evidence", suppression_reason="insufficient_watch_evidence")
+                return self._decision(event, Action.REMEMBER, "model INVESTIGATE lacks active evidence; retained as memory", reason_code="MODEL_INVESTIGATE_REMEMBERED")
+            return self._decision(event, Action.IGNORE, "model INVESTIGATE lacks active evidence", suppression_reason="insufficient_watch_evidence", reason_code="MODEL_INVESTIGATE_SUPPRESSED")
 
         if candidate == Action.NOTIFY:
             return self._model_notify_decision(event, now, working_context)
@@ -176,7 +187,7 @@ class ProactivePolicy:
         if not scores_ok:
             reason = "model NOTIFY suppressed by notification score thresholds"
             suppression = "low_interrupt_score" if event.interrupt_score < self.thresholds.notify_min_interrupt_score else "low_confidence_or_importance"
-            return self._decision(event, Action.INVESTIGATE if self._meets_investigate_threshold(event) else Action.IGNORE, reason, evidence=watch_evidence, watch=active, suppression_reason=suppression)
+            return self._decision(event, Action.INVESTIGATE if self._meets_investigate_threshold(event) else Action.IGNORE, reason, evidence=watch_evidence, watch=active, suppression_reason=suppression, reason_code="MODEL_NOTIFY_SCORE_SUPPRESSED")
         if not evidence_ok:
             return self._decision(
                 event,
@@ -185,6 +196,7 @@ class ProactivePolicy:
                 evidence=watch_evidence,
                 watch=active,
                 suppression_reason="insufficient_watch_evidence",
+                reason_code="MODEL_NOTIFY_EVIDENCE_SUPPRESSED",
             )
         allowed, reason = self.hard_rules.can_notify(
             event,
@@ -201,6 +213,7 @@ class ProactivePolicy:
                 evidence=watch_evidence,
                 watch=active,
                 suppression_reason=self._suppression_code(reason),
+                reason_code="MODEL_NOTIFY_HARD_RULE_SUPPRESSED",
             )
         return self._decision(
             event,
@@ -210,6 +223,7 @@ class ProactivePolicy:
             watch=active,
             notification_title="Ambient Secretary",
             notification_body="A watched work pattern has enough evidence for a deliberate check.",
+            reason_code="MODEL_NOTIFY_ACCEPTED",
         )
 
     def _decision(
@@ -226,6 +240,7 @@ class ProactivePolicy:
         notification_body: str | None = None,
         suppression_reason: str | None = None,
         cloud_escalation_candidate: bool = False,
+        reason_code: str = "POLICY_IGNORE",
     ) -> Decision:
         watched = hypothesis or watch or self.watch.active
         return Decision(
@@ -243,6 +258,7 @@ class ProactivePolicy:
             watch_evidence=watched.evidence if watched else 0,
             suppression_reason=suppression_reason,
             cloud_escalation_candidate=cloud_escalation_candidate,
+            reason_code=reason_code,
         )
 
     def _meaningful(self, event: ExtractedEvent) -> bool:

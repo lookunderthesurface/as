@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-28T10:00:00Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest -q FAILED test_policy.py"}
+{"timestamp":"2026-08-28T10:00:40Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest -q FAILED test_policy.py"}
+{"timestamp":"2026-08-28T10:01:20Z","foreground_app":"chrome.exe","window_title":"pytest docs","event_source":"navigation","text":"pytest documentation search"}
+{"timestamp":"2026-08-28T10:02:00Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest -q FAILED test_policy.py"}
+{"timestamp":"2026-08-28T10:02:40Z","foreground_app":"WindowsTerminal.exe","window_title":"PowerShell","event_source":"command","text":"pytest -q FAILED test_policy.py"}
