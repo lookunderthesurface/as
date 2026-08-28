@@ -28,7 +28,11 @@ from .inference.schema import InferenceRequest
 from .inference.stale import ResultFreshness, assess_result
 from .inference.status import InferenceRuntimeState, LocalInferenceStatus
 from .memory.intervention import classify_situation
-from .memory.retrieval import retrieve_relevant_intervention_preferences, retrieve_similar_intervention_episodes
+from .memory.retrieval import (
+    retrieve_relevant_intervention_preferences,
+    retrieve_relevant_knowledge,
+    retrieve_similar_intervention_episodes,
+)
 from .perception.extractor import ExtractedEvent, EventExtractor
 from .policy.context import DecisionContext
 from .policy.hard_rules import HardRules
@@ -579,8 +583,11 @@ class SecretaryEngine:
         failure_count = self.store.count_failures(extracted.failure_signature, since=resolved_at) if extracted.failure_signature else 0
         preferences = retrieve_relevant_intervention_preferences(self.store, extracted)
         similar_episodes = retrieve_similar_intervention_episodes(self.store, extracted)
+        knowledge = retrieve_relevant_knowledge(self.store, extracted)
         if preferences:
             self.counters.increment("preference_matches")
+        if knowledge:
+            self.counters.increment("knowledge_matches")
         decision = self.policy.decide_context(
             DecisionContext(
                 event=extracted,
@@ -593,6 +600,7 @@ class SecretaryEngine:
                 world_state=self.cognition.world,
                 preferences=tuple(preferences),
                 similar_episodes=tuple(similar_episodes),
+                relevant_memories=tuple(knowledge),
             )
         )
         transitions = self.watch.peek_transitions()
@@ -642,6 +650,9 @@ class SecretaryEngine:
             reason_codes = [decision.reason_code]
             if decision.preference_effect:
                 reason_codes.append(decision.preference_effect)
+            for critique_reason in decision.critique_reasons:
+                if critique_reason not in reason_codes:
+                    reason_codes.append(critique_reason)
             intervention_episode_id = self.store.record_intervention_episode(
                 session_id=self.session_id,
                 event_timestamp=event.timestamp,

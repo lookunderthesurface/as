@@ -14,7 +14,14 @@ def _clean(value: str, limit: int) -> str:
 
 @dataclass
 class WatchHypothesis:
-    """A bounded, expiring observation hypothesis, not an instruction."""
+    """A bounded, expiring observation hypothesis, not an instruction.
+
+    Beyond a bare counter, a hypothesis accumulates explainable evidence:
+    repeated signature hits, related research observed, and how long the
+    pattern has persisted. ``intervention_readiness`` folds these (plus an
+    optional externally supplied memory-support signal) into a single
+    0..1 maturity score that the critic and policy can reason about.
+    """
 
     signature: str
     hypothesis: str
@@ -25,6 +32,7 @@ class WatchHypothesis:
     updated_at: datetime | None = None
     status: str = "ACTIVE"
     instance_id: str | None = None
+    research_seen: int = 0
 
     @property
     def reason(self) -> str:
@@ -36,12 +44,27 @@ class WatchHypothesis:
         # this bounded lifecycle instance so an expired watch cannot close a new one.
         return self.instance_id or self.signature
 
+    def intervention_readiness(self, memory_support: float = 0.0, *, now: datetime | None = None) -> float:
+        """Explainable 0..1 maturity; no magic numbers hidden from the trace."""
+        evidence_factor = min(1.0, max(0, self.evidence) / 4.0) * 0.40
+        research_factor = min(1.0, max(0, self.research_seen) / 2.0) * 0.20
+        reference = now or self.updated_at or self.created_at
+        try:
+            minutes_active = max(0.0, (reference - self.created_at).total_seconds() / 60.0)
+        except TypeError:
+            minutes_active = 0.0
+        duration_factor = min(1.0, minutes_active / 30.0) * 0.15
+        memory_factor = max(0.0, min(1.0, memory_support)) * 0.25
+        return min(1.0, evidence_factor + research_factor + duration_factor + memory_factor)
+
     def as_dict(self) -> dict[str, object]:
         return {
             "id": self.watch_id,
             "signature": self.signature,
             "hypothesis": self.hypothesis,
             "evidence": self.evidence,
+            "research_seen": self.research_seen,
+            "readiness": round(self.intervention_readiness(), 3),
             "created_at": self.created_at.isoformat(),
             "updated_at": (self.updated_at or self.created_at).isoformat(),
             "expires_at": self.expires_at.isoformat(),
@@ -232,6 +255,7 @@ class WatchManager:
         item = self.active
         if item is None or event.event_type != "documentation":
             return 0
+        item.research_seen += 1
         self._touch(item, now, "related documentation search")
         return 1
 

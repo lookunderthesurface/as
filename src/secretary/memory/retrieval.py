@@ -67,6 +67,47 @@ def retrieve_similar_intervention_episodes(
     return [item[1] for item in ranked[: max(1, min(20, limit))]]
 
 
+def retrieve_relevant_knowledge(
+    store: MemoryStore,
+    event: ExtractedEvent,
+    *,
+    limit: int = 3,
+) -> list[dict[str, object]]:
+    """Retrieve durable knowledge relevant to the current semantic moment.
+
+    Deterministic matching only: topic-token overlap, tag overlap, or a
+    failure-signature mention inside the statement. ACTIVE rows only.
+    Returns a small, bounded slice intended for the Brain context and for
+    making candidate suggestions concrete instead of generic.
+    """
+    topic = str(event.topic or "")
+    signature = str(event.failure_signature or "")
+    topic_tokens = set(_tokens(topic))
+    ranked: list[tuple[int, dict[str, object]]] = []
+    for memory in store.active_memories(tier="SEMANTIC", limit=200):
+        content = str(memory.get("content") or "")
+        tags = str(memory.get("tags") or "")
+        confidence = float(memory.get("confidence") or 0.0)
+        score = 0
+        if signature and signature.casefold() in content.casefold():
+            score += 8
+        if topic_tokens:
+            statement_tokens = set(_tokens(content)) | set(_tokens(tags))
+            overlap = topic_tokens & statement_tokens
+            if overlap:
+                score += min(4, len(overlap))
+        knowledge_kind = "timing" if "timing-knowledge" in tags else "content" if "content-knowledge" in tags else "experience"
+        if knowledge_kind != "experience":
+            score += 2
+        if score > 0:
+            item = dict(memory)
+            item["match_score"] = score
+            item["knowledge_kind"] = knowledge_kind
+            ranked.append((score + confidence, item))
+    ranked.sort(key=lambda item: -item[0])
+    return [item[1] for item in ranked[: max(1, min(5, limit))]]
+
+
 def _context_score(
     value: Mapping[str, object],
     *,

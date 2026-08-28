@@ -45,17 +45,29 @@ class InterventionLabel(str, Enum):
     These labels affect the *evaluation matrix*, not durable preferences:
     a 'not needed' label must not silently become a policy preference; it is
     real data for the offline precision/false-alarm numbers instead.
+
+    Timing vs content are deliberately separable: "good advice, wrong moment"
+    and "well-timed but useless advice" must learn into different memories.
     """
 
     USEFUL = "USEFUL"
     NOT_USEFUL = "NOT_USEFUL"
     NEEDED_BAD_TIMING = "NEEDED_BAD_TIMING"
+    GOOD_CONTENT_BAD_TIMING = "GOOD_CONTENT_BAD_TIMING"
+    GOOD_TIMING_BAD_CONTENT = "GOOD_TIMING_BAD_CONTENT"
+    ALREADY_KNEW = "ALREADY_KNEW"
+    MISSED_CONTEXT = "MISSED_CONTEXT"
     NOT_NEEDED = "NOT_NEEDED"
     UNSURE = "UNSURE"
 
     @property
     def needed(self) -> bool:
-        return self in {InterventionLabel.USEFUL, InterventionLabel.NEEDED_BAD_TIMING}
+        return self in {
+            InterventionLabel.USEFUL,
+            InterventionLabel.NEEDED_BAD_TIMING,
+            InterventionLabel.GOOD_CONTENT_BAD_TIMING,
+            InterventionLabel.MISSED_CONTEXT,
+        }
 
     @property
     def valid_intervention(self) -> bool:
@@ -64,7 +76,19 @@ class InterventionLabel(str, Enum):
 
     @property
     def timing_problem(self) -> bool:
-        return self is InterventionLabel.NEEDED_BAD_TIMING
+        return self in {InterventionLabel.NEEDED_BAD_TIMING, InterventionLabel.GOOD_CONTENT_BAD_TIMING}
+
+    @property
+    def content_problem(self) -> bool:
+        return self in {InterventionLabel.NOT_USEFUL, InterventionLabel.GOOD_TIMING_BAD_CONTENT, InterventionLabel.ALREADY_KNEW}
+
+    @property
+    def timing_ok(self) -> bool:
+        return self in {InterventionLabel.USEFUL, InterventionLabel.GOOD_TIMING_BAD_CONTENT}
+
+    @property
+    def content_ok(self) -> bool:
+        return self in {InterventionLabel.USEFUL, InterventionLabel.GOOD_CONTENT_BAD_TIMING, InterventionLabel.MISSED_CONTEXT}
 
 
 def parse_label(value: str | InterventionLabel | None) -> InterventionLabel:
@@ -250,6 +274,70 @@ class FeedbackInstruction:
     value: str
     reaction: UserReaction = UserReaction.UNKNOWN
     preference: PreferenceKind | None = None
+
+
+TIMING_FEEDBACK_VALUES = ("GOOD", "TOO_EARLY", "TOO_LATE", "BAD", "SILENT")
+CONTENT_FEEDBACK_VALUES = ("RELEVANT", "IRRELEVANT", "ALREADY_KNEW", "WRONG", "USEFUL", "TOO_GENERIC")
+
+
+@dataclass(frozen=True)
+class DimensionalFeedback:
+    """Two-axis explicit feedback: when to speak vs what to say.
+
+    Timing and content learn into different memories so the system can
+    distinguish "right advice, wrong moment" from "well-timed but useless".
+    """
+
+    timing: str | None = None
+    content: str | None = None
+
+    @property
+    def is_explicit(self) -> bool:
+        return bool(self.timing or self.content)
+
+    @property
+    def timing_positive(self) -> bool:
+        return self.timing in {"GOOD"}
+
+    @property
+    def timing_negative(self) -> bool:
+        return self.timing in {"TOO_EARLY", "TOO_LATE", "BAD", "SILENT"}
+
+    @property
+    def content_positive(self) -> bool:
+        return self.content in {"RELEVANT", "USEFUL"}
+
+    @property
+    def content_negative(self) -> bool:
+        return self.content in {"IRRELEVANT", "ALREADY_KNEW", "WRONG", "TOO_GENERIC"}
+
+
+def normalize_timing_feedback(value: str | None) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    key = str(value).strip().upper().replace("-", "_").replace(" ", "_")
+    if key in {"GOOD_TIMING", "OK_TIMING", "RIGHT_TIMING"}:
+        key = "GOOD"
+    if key in {"EARLY"}:
+        key = "TOO_EARLY"
+    if key in {"LATE"}:
+        key = "TOO_LATE"
+    if key not in TIMING_FEEDBACK_VALUES:
+        raise ValueError(f"unsupported timing feedback {value!r}; use one of: {', '.join(TIMING_FEEDBACK_VALUES)}")
+    return key
+
+
+def normalize_content_feedback(value: str | None) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    key = str(value).strip().upper().replace("-", "_").replace(" ", "_")
+    if key in {"GENERIC"}:
+        key = "TOO_GENERIC"
+    if key in {"KNEW"}:
+        key = "ALREADY_KNEW"
+    if key not in CONTENT_FEEDBACK_VALUES:
+        raise ValueError(f"unsupported content feedback {value!r}; use one of: {', '.join(CONTENT_FEEDBACK_VALUES)}")
+    return key
 
 
 _FEEDBACK_ALIASES: dict[str, FeedbackInstruction] = {

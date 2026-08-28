@@ -183,7 +183,9 @@ CREATE TABLE IF NOT EXISTS intervention_episodes (
     preference_ids TEXT NOT NULL DEFAULT '[]',
     learned_preference_id INTEGER,
     user_label TEXT,
-    labeled_at TEXT
+    labeled_at TEXT,
+    timing_feedback TEXT,
+    content_feedback TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_intervention_episodes_time ON intervention_episodes(event_timestamp);
 CREATE INDEX IF NOT EXISTS idx_intervention_episodes_watch ON intervention_episodes(watch_id, status);
@@ -268,7 +270,7 @@ _LABEL_ALIASES = {
 
 class MemoryStore:
     # Intervention tables and trace columns are an additive schema migration.
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, path: str | Path = "data/state.db") -> None:
         self.path = str(path)
@@ -300,6 +302,8 @@ class MemoryStore:
         self._ensure_column("intervention_episodes", "learned_preference_id", "INTEGER")
         self._ensure_column("intervention_episodes", "user_label", "TEXT")
         self._ensure_column("intervention_episodes", "labeled_at", "TEXT")
+        self._ensure_column("intervention_episodes", "timing_feedback", "TEXT")
+        self._ensure_column("intervention_episodes", "content_feedback", "TEXT")
         self._ensure_column("memories", "tier", "TEXT NOT NULL DEFAULT 'SEMANTIC'")
         self._ensure_column("memories", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'")
         self._ensure_column("memories", "confidence", "REAL NOT NULL DEFAULT 0.5")
@@ -881,8 +885,93 @@ class MemoryStore:
             self.connection.commit()
         return preference_id
 
+    def record_dimensional_feedback(
+        self,
+        episode_id: int,
+        *,
+        timing: str | None = None,
+        content: str | None = None,
+        note: str = "",
+    ) -> dict[str, object]:
+        """Two-axis explicit feedback: timing and content learn separately.
+
+        Timing feedback becomes TIMING knowledge (when to speak);
+        content feedback becomes CONTENT knowledge (what is worth saying).
+        Both are durable, auditable, and explicitly user-sourced.
+        """
+        from .intervention import normalize_content_feedback, normalize_timing_feedback
+
+        episode = self.get_intervention_episode(episode_id)
+        if episode is None:
+            raise ValueError(f"intervention episode not found: {episode_id}")
+        timing_value = normalize_timing_feedback(timing)
+        content_value = normalize_content_feedback(content)
+        if not timing_value and not content_value:
+            raise ValueError("dimensional feedback requires --timing and/or --content")
+        self.connection.execute(
+            """UPDATE intervention_episodes
+               SET timing_feedback = COALESCE(?, timing_feedback),
+                   content_feedback = COALESCE(?, content_feedback),
+                   updated_at = ?
+               WHERE id = ?""",
+            (timing_value, content_value, _utc_iso(), int(episode_id)),
+        )
+        situation = str(episode.get("situation_type") or "desktop")
+        activity = str(episode.get("activity") or "desktop")
+        topic = str(episode.get("topic") or "")[:120]
+        created: list[int] = []
+        if timing_value:
+            if timing_value == "GOOD":
+                statement = f"Timing knowledge: during {situation} ({activity}), intervening at this point was well timed."
+            elif timing_value == "TOO_EARLY":
+                statement = f"Timing knowledge: during {situation} ({activity}), wait for stronger repeated evidence before intervening."
+            elif timing_value == "TOO_LATE":
+                statement = f"Timing knowledge: during {situation} ({activity}), the user wanted to hear this earlier."
+            elif timing_value == "SILENT":
+                statement = f"Timing knowledge: during {situation} ({activity}), staying silent was the better choice."
+            else:
+                statement = f"Timing knowledge: during {situation} ({activity}), this intervention timing was poor."
+            created.append(self.record_memory(
+                statement,
+                source=MemorySource.EXPLICIT_USER,
+                importance=0.9,
+                tier=MemoryTier.SEMANTIC,
+                confidence=1.0,
+                tags=f"timing-knowledge|{topic}".strip("|"),
+            ))
+        if content_value:
+            if content_value in {"RELEVANT", "USEFUL"}:
+                statement = f"Content knowledge: for {topic or situation}, concrete suggestions at this specificity were useful."
+            elif content_value == "TOO_GENERIC":
+                statement = f"Content knowledge: generic advice about {topic or situation} is low value; prefer specific prior conclusions."
+            elif content_value == "ALREADY_KNEW":
+                statement = f"Content knowledge: the user already knows the basics about {topic or situation}; only add new information."
+            elif content_value == "WRONG":
+                statement = f"Content knowledge: the suggestion about {topic or situation} was factually wrong; do not repeat it."
+            else:
+                statement = f"Content knowledge: suggestions about {topic or situation} of this kind were irrelevant."
+            created.append(self.record_memory(
+                statement,
+                source=MemorySource.EXPLICIT_USER,
+                importance=0.9,
+                tier=MemoryTier.SEMANTIC,
+                confidence=1.0,
+                tags=f"content-knowledge|{topic}".strip("|"),
+            ))
+        if note.strip():
+            self.connection.execute(
+                "UPDATE intervention_episodes SET explicit_feedback = COALESCE(explicit_feedback, '') || ? WHERE id = ?",
+                (sanitize_semantic_label(f" [fb:{timing_value or '-'}/{content_value or '-'}] {note}", 300), int(episode_id)),
+            )
+        self.connection.commit()
+        return {
+            "episode_id": int(episode_id),
+            "timing": timing_value,
+            "content": content_value,
+            "knowledge_memory_ids": created,
+        }
+
     def label_intervention_episode(self, episode_id: int, label, *, note: str = "") -> dict[str, object] | None:
-        """Attach a human shadow label to one unlabeled episode (evaluation only)."""
         from .intervention import parse_label
 
         episode = self.get_intervention_episode(episode_id)

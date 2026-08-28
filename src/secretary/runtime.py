@@ -31,6 +31,7 @@ COUNTER_NAMES = (
     "real_notify",
     "intervention_episodes_recorded",
     "preference_matches",
+    "knowledge_matches",
     "watch_resolved",
     "watch_expired",
     "visual_keyframes",

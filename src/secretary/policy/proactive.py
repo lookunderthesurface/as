@@ -10,6 +10,7 @@ from ..inference.schema import Action
 from ..memory.intervention import PreferenceKind, PreferenceSource
 from ..perception.extractor import ExtractedEvent
 from .context import DecisionContext
+from .critic import InterventionCritic, REASON_RELATED_PAST_SOLUTION_AVAILABLE, summarize_knowledge
 from .hard_rules import HardRules
 from .watch import WatchHypothesis, WatchManager
 
@@ -48,6 +49,7 @@ class Decision:
     preference_ids: tuple[int, ...] = ()
     preference_effect: str | None = None
     similar_episode_ids: tuple[int, ...] = ()
+    critique_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,10 +91,12 @@ class ProactivePolicy:
         watch: WatchManager,
         hard_rules: HardRules,
         thresholds: PolicyThresholds | None = None,
+        critic: InterventionCritic | None = None,
     ) -> None:
         self.watch = watch
         self.hard_rules = hard_rules
         self.thresholds = thresholds or PolicyThresholds()
+        self.critic = critic or InterventionCritic()
 
     def decide(
         self,
@@ -193,6 +197,29 @@ class ProactivePolicy:
                     )
                 allowed, reason = self.hard_rules.can_notify(event, now, require_interrupt=False)
                 if allowed:
+                    critique = self.critic.critique(context, watch_evidence=evidence)
+                    body = "The same failure pattern keeps recurring. Pause for a deliberate check of the failing command and the latest change."
+                    critique_reasons = list(critique.reasons)
+                    knowledge_line = summarize_knowledge(context.relevant_memories or ())
+                    if knowledge_line:
+                        body = f"{body} Related past conclusion: {knowledge_line}"
+                        if REASON_RELATED_PAST_SOLUTION_AVAILABLE not in critique_reasons:
+                            critique_reasons.append(REASON_RELATED_PAST_SOLUTION_AVAILABLE)
+                    if critique.recommendation == "SILENT":
+                        # Strong deterministic evidence still requires the
+                        # critic's consent only at the extreme end; a SILENT
+                        # verdict means learned negative signals dominate.
+                        return self._decision(
+                            event,
+                            Action.INVESTIGATE,
+                            "repeated failure notification suppressed by intervention critic",
+                            evidence=evidence,
+                            deterministic_evidence=failure_count,
+                            suppression_reason="critic_silent",
+                            reason_code="CRITIC_SUPPRESSED_REPEATED_FAILURE",
+                            preference_context=preference_context,
+                            critique_reasons=tuple(critique_reasons),
+                        )
                     return self._decision(
                         event,
                         Action.NOTIFY,
@@ -200,9 +227,10 @@ class ProactivePolicy:
                         evidence=evidence,
                         deterministic_evidence=failure_count,
                         notification_title="Ambient Secretary",
-                        notification_body="The same failure pattern keeps recurring. Pause for a deliberate check of the failing command and the latest change.",
+                        notification_body=body,
                         reason_code="REPEATED_FAILURE_NOTIFY",
                         preference_context=preference_context,
+                        critique_reasons=tuple(critique_reasons),
                     )
                 return self._decision(
                     event,
@@ -296,7 +324,7 @@ class ProactivePolicy:
             return self._decision(event, Action.IGNORE, "model INVESTIGATE lacks active evidence", suppression_reason="insufficient_watch_evidence", reason_code="MODEL_INVESTIGATE_SUPPRESSED", preference_context=preference_context)
 
         if candidate == Action.NOTIFY:
-            return self._model_notify_decision(event, now, working_context, deterministic_evidence, preference_context)
+            return self._model_notify_decision(event, now, working_context, deterministic_evidence, preference_context, context)
 
         return self._decision(event, Action.IGNORE, "no high-value intervention is indicated", preference_context=preference_context)
 
@@ -307,6 +335,7 @@ class ProactivePolicy:
         working_context: bool,
         deterministic_evidence: int,
         preference_context: PreferenceContext,
+        context: DecisionContext | None = None,
     ) -> Decision:
         active = self.watch.active
         watch_evidence = active.evidence if active else 0
@@ -371,6 +400,40 @@ class ProactivePolicy:
                 reason_code="MODEL_NOTIFY_HARD_RULE_SUPPRESSED",
                 preference_context=preference_context,
             )
+        critique_reasons: tuple[str, ...] = ()
+        if context is not None:
+            critique = self.critic.critique(context, watch_evidence=watch_evidence)
+            critique_reasons = critique.reasons
+            if critique.recommendation == "SILENT":
+                # Learned negative experience dominates this moment.
+                return self._decision(
+                    event,
+                    Action.INVESTIGATE,
+                    "model NOTIFY suppressed by intervention critic",
+                    evidence=watch_evidence,
+                    watch=active,
+                    suppression_reason="critic_silent",
+                    reason_code="CRITIC_SUPPRESSED_MODEL_NOTIFY",
+                    preference_context=preference_context,
+                    critique_reasons=critique_reasons,
+                )
+            body = "A watched work pattern has enough evidence for a deliberate check."
+            knowledge_line = summarize_knowledge(context.relevant_memories or ())
+            if knowledge_line:
+                body = f"{body} Related past conclusion: {knowledge_line}"
+                critique_reasons = tuple(dict.fromkeys((*critique_reasons, REASON_RELATED_PAST_SOLUTION_AVAILABLE)))
+            return self._decision(
+                event,
+                Action.NOTIFY,
+                "model NOTIFY passed evidence, score, critic, and hard gates",
+                evidence=watch_evidence,
+                watch=active,
+                notification_title="Ambient Secretary",
+                notification_body=body,
+                reason_code="MODEL_NOTIFY_ACCEPTED",
+                preference_context=preference_context,
+                critique_reasons=critique_reasons,
+            )
         return self._decision(
             event,
             Action.NOTIFY,
@@ -399,6 +462,7 @@ class ProactivePolicy:
         cloud_escalation_candidate: bool = False,
         reason_code: str = "POLICY_IGNORE",
         preference_context: PreferenceContext | None = None,
+        critique_reasons: tuple[str, ...] = (),
     ) -> Decision:
         watched = hypothesis or watch or self.watch.active
         context = preference_context or PreferenceContext()
@@ -421,6 +485,7 @@ class ProactivePolicy:
             preference_ids=context.ids,
             preference_effect=context.effect,
             similar_episode_ids=context.similar_episode_ids,
+            critique_reasons=critique_reasons,
         )
 
     @staticmethod
