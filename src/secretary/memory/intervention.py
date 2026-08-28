@@ -6,15 +6,106 @@ from typing import Mapping
 
 
 class UserReaction(str, Enum):
-    """Observed or explicitly reported reaction to an intervention."""
+    """Observed or explicitly reported reaction to an intervention.
+
+    Implicit observations (OPENED/DISMISSED/IGNORED) are weak evidence only:
+    IGNORED may just mean the user was busy. Explicit labels
+    (ACCEPTED/REJECTED/EXPLICIT_POSITIVE/EXPLICIT_NEGATIVE) are durable and
+    have the strongest weighting.
+    """
 
     UNKNOWN = "UNKNOWN"
     OPENED = "OPENED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
     DISMISSED = "DISMISSED"
     IGNORED = "IGNORED"
     FOLLOWED = "FOLLOWED"
     EXPLICIT_POSITIVE = "EXPLICIT_POSITIVE"
     EXPLICIT_NEGATIVE = "EXPLICIT_NEGATIVE"
+
+    @property
+    def is_explicit(self) -> bool:
+        return self in {
+            UserReaction.ACCEPTED,
+            UserReaction.REJECTED,
+            UserReaction.EXPLICIT_POSITIVE,
+            UserReaction.EXPLICIT_NEGATIVE,
+        }
+
+    @property
+    def is_weak(self) -> bool:
+        # Implicit observations never become durable negative preferences.
+        return self in {UserReaction.OPENED, UserReaction.DISMISSED, UserReaction.IGNORED, UserReaction.FOLLOWED}
+
+
+class InterventionLabel(str, Enum):
+    """Human labels for shadow-mode WOULD_NOTIFY episodes.
+
+    These labels affect the *evaluation matrix*, not durable preferences:
+    a 'not needed' label must not silently become a policy preference; it is
+    real data for the offline precision/false-alarm numbers instead.
+    """
+
+    USEFUL = "USEFUL"
+    NOT_USEFUL = "NOT_USEFUL"
+    NEEDED_BAD_TIMING = "NEEDED_BAD_TIMING"
+    NOT_NEEDED = "NOT_NEEDED"
+    UNSURE = "UNSURE"
+
+    @property
+    def needed(self) -> bool:
+        return self in {InterventionLabel.USEFUL, InterventionLabel.NEEDED_BAD_TIMING}
+
+    @property
+    def valid_intervention(self) -> bool:
+        """Would an intervention have been appropriate at proposal time?"""
+        return self in {InterventionLabel.USEFUL, InterventionLabel.NOT_NEEDED}
+
+    @property
+    def timing_problem(self) -> bool:
+        return self is InterventionLabel.NEEDED_BAD_TIMING
+
+
+def parse_label(value: str | InterventionLabel | None) -> InterventionLabel:
+    if value is None:
+        return InterventionLabel.UNSURE
+    if isinstance(value, InterventionLabel):
+        return value
+    return InterventionLabel(value.strip().upper().replace("-", "_"))
+
+
+_LABEL_ALIASES: dict[str, InterventionLabel] = {
+    "USEFUL": InterventionLabel.USEFUL,
+    "NOT_USEFUL": InterventionLabel.NOT_USEFUL,
+    "NOT-USEFUL": InterventionLabel.NOT_USEFUL,
+    "NEEDED_BAD_TIMING": InterventionLabel.NEEDED_BAD_TIMING,
+    "NEEDED-BUT-BAD-TIMING": InterventionLabel.NEEDED_BAD_TIMING,
+    "NEEDED_BUT_BAD_TIMING": InterventionLabel.NEEDED_BAD_TIMING,
+    "BAD_TIMING": InterventionLabel.NEEDED_BAD_TIMING,
+    "NOT_NEEDED": InterventionLabel.NOT_NEEDED,
+    "NOT-NEEDED": InterventionLabel.NOT_NEEDED,
+    "NOT_NEEDED_BUT_OTHER": InterventionLabel.NOT_NEEDED,
+    "UNSURE": InterventionLabel.UNSURE,
+}
+
+
+def normalize_label(value: str) -> InterventionLabel:
+    key = value.strip().upper().replace(" ", "_")
+    label = _LABEL_ALIASES.get(key)
+    if label is None:
+        allowed = ", ".join(sorted({item.value for item in _LABEL_ALIASES.values()}))
+        raise ValueError(f"unsupported label {value!r}; use one of: {allowed}")
+    return label
+
+
+def label_weight(instruction: FeedbackInstruction) -> float:
+    """Relative weight of a feedback instruction; explicit beats implicit."""
+    if instruction.reaction.is_explicit:
+        return 1.0
+    if instruction.reaction.is_weak:
+        return 0.15
+    return 0.0
 
 
 class InterventionOutcome(str, Enum):
@@ -187,6 +278,15 @@ def normalize_feedback(value: str) -> FeedbackInstruction:
         allowed = ", ".join(sorted({item.value for item in _FEEDBACK_ALIASES.values()}))
         raise ValueError(f"unsupported feedback value {value!r}; use one of: {allowed}")
     return instruction
+
+
+def feedback_instruction_for_user_reaction(reaction: UserReaction) -> FeedbackInstruction:
+    """Weak observed-reaction feedback: observation without a durable rule.
+
+    A reaction like IGNORED or UNKNOWN must never by itself create a
+    preference. Explicit user feedback is always preferred.
+    """
+    return FeedbackInstruction("OBSERVED", reaction=reaction)
 
 
 def parse_reaction(value: str | UserReaction | None) -> UserReaction:

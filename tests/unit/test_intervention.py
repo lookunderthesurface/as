@@ -436,3 +436,76 @@ class InterventionTests(unittest.TestCase):
             self.assertEqual(decisions[0][0], "[redacted]")
             self.assertEqual(traces[0][0], "[redacted]")
             store.close()
+
+    def test_shadow_label_attach_summary_and_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(Path(directory) / "state.db")
+            episode_id = store.record_intervention_episode(
+                session_id=None,
+                event_timestamp=NOW,
+                situation_type="debugging",
+                activity="terminal",
+                event_type="failure",
+                topic="test-failure:python",
+                failure_signature="test-failure:python",
+                candidate_action="NOTIFY",
+                final_action="WOULD_NOTIFY",
+            )
+            first = store.label_intervention_episode(episode_id, "useful", note="helped me find the KV fix")
+            self.assertTrue(first["updated"])
+            self.assertEqual(first["user_label"], "USEFUL")
+            again = store.label_intervention_episode(episode_id, "not-useful")
+            self.assertFalse(again["updated"])
+            self.assertEqual(again["already_labeled"], "USEFUL")
+            labeled = store.labeled_intervention_episodes()
+            self.assertEqual(len(labeled), 1)
+            summary = store.intervention_label_summary()
+            self.assertEqual(summary["labels"], {"USEFUL": 1})
+            self.assertEqual(summary["unlabeled_total"], 0)
+            store.close()
+
+    def test_implicit_weak_observation_cannot_create_strong_negative_preference(self) -> None:
+        """IGNORED is weak evidence by construction (user may just be busy)."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(Path(directory) / "state.db")
+            episode_id = store.record_intervention_episode(
+                session_id=None,
+                event_timestamp=NOW,
+                situation_type="debugging",
+                activity="terminal",
+                event_type="failure",
+                topic="test-failure:python",
+                failure_signature="test-failure:python",
+                candidate_action="NOTIFY",
+                final_action="WOULD_NOTIFY",
+            )
+            from secretary.memory.intervention import UserReaction, feedback_instruction_for_user_reaction
+
+            instruction = feedback_instruction_for_user_reaction(UserReaction.IGNORED)
+            # Observed-weak feedback must not create an EXPLICIT preference.
+            result = store.record_intervention_feedback(episode_id, instruction.value, reaction=instruction.reaction)
+            prefs = store.active_intervention_preferences()
+            self.assertEqual(prefs, [])
+            self.assertEqual(result["reaction"], UserReaction.IGNORED.value)
+            store.close()
+
+    def test_explicit_positive_feedback_creates_strong_preference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(Path(directory) / "state.db")
+            episode_id = store.record_intervention_episode(
+                session_id=None,
+                event_timestamp=NOW,
+                situation_type="debugging",
+                activity="terminal",
+                event_type="failure",
+                topic="test-failure:python",
+                failure_signature="test-failure:python",
+                candidate_action="NOTIFY",
+                final_action="WOULD_NOTIFY",
+            )
+            store.record_intervention_feedback(episode_id, "useful")
+            preferences = store.active_intervention_preferences()
+            self.assertEqual(len(preferences), 1)
+            self.assertEqual(preferences[0]["source"], "EXPLICIT_USER")
+            self.assertAlmostEqual(float(preferences[0]["confidence"]), 1.0, places=3)
+            store.close()

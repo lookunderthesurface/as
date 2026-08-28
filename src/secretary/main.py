@@ -86,6 +86,26 @@ def run_replay(path: Path, config: SecretaryConfig | None = None) -> int:
         engine.close()
 
 
+def run_label_summary(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+    """Show label counts only; TP/FP are computed only in evaluation benchmarks."""
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        summary = store.intervention_label_summary()
+        print("Ambient Secretary Intervention Labels", file=output)
+        print("\nLabeled:", file=output)
+        if not summary["labels"]:
+            print("  (none)", file=output)
+        for label, count in sorted(summary["labels"].items()):
+            print(f"  {label}: {count}", file=output)
+        print(f"\nLabeled total: {summary['labeled_total']}", file=output)
+        print(f"Unlabeled total: {summary['unlabeled_total']}", file=output)
+        print("\nLabel vocabulary:", ", ".join(summary["suggested_feedback"]), file=output)
+        return 0
+    finally:
+        store.close()
+
+
 def run_session_report(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
     config = config or SecretaryConfig.from_environment()
     store = MemoryStore(config.database_path)
@@ -276,6 +296,61 @@ def run_secretary_profile(config: SecretaryConfig | None = None, output=sys.stdo
         return 0
     finally:
         store.close()
+
+
+def run_pending_labels(config: SecretaryConfig | None = None, output=sys.stdout, *, notify_only: bool = True, limit: int = 20) -> int:
+    """List unlabeled shadow intervention opportunities for human review."""
+    config = config or SecretaryConfig.from_environment()
+    store = MemoryStore(config.database_path)
+    try:
+        episodes = store.unlabeled_intervention_episodes(notify_only=notify_only, limit=limit)
+        print("Ambient Secretary Unlabeled Interventions", file=output)
+        if not episodes:
+            print("\nNo unlabeled intervention episodes.", file=output)
+            return 0
+        for episode in episodes:
+            timestamp = str(episode.get("event_timestamp") or "").replace("T", " ")[:19]
+            print(f"\n#{episode['id']} {timestamp}", file=output)
+            print(f"  Situation: {episode['situation_type']} / {episode['activity']}", file=output)
+            print(f"  Final: {episode['final_action']}  notified={'yes' if episode['was_notified'] else 'no'}", file=output)
+            reason_codes = episode.get("reason_codes") or []
+            if reason_codes:
+                print(f"  Reasons: {', '.join(str(code) for code in reason_codes)}", file=output)
+            if episode.get("summary"):
+                print(f"  Summary: {episode['summary'][:160]}", file=output)
+            print(f"  Label with: secretary label {episode['id']} <useful|not-useful|needed-but-bad-timing|not-needed|unsure>", file=output)
+        return 0
+    finally:
+        store.close()
+
+
+def run_label_episode(config: SecretaryConfig | None = None, episode_id: int | None = None, value: str | None = None, output=sys.stdout, *, note: str = "") -> int:
+    """Attach a human truth label to one intervention episode."""
+    if episode_id is None or value is None:
+        print("label requires an episode id and a value (useful, not-useful, needed-but-bad-timing, not-needed, unsure).", file=output)
+        return 2
+    config = config or SecretaryConfig.from_environment()
+    store: MemoryStore | None = None
+    try:
+        from .memory.intervention import normalize_label
+
+        label = normalize_label(value)
+        store = MemoryStore(config.database_path)
+        result = store.label_intervention_episode(int(episode_id), label, note=note)
+        if result is None:
+            print(f"Intervention episode #{episode_id} not found.", file=output)
+            return 2
+        if result.get("already_labeled"):
+            print(f"Episode #{episode_id} already labeled: {result['already_labeled']} (unchanged).", file=output)
+            return 0
+        print(f"Labeled episode #{episode_id}: {result['user_label']}", file=output)
+        return 0
+    except (ValueError, OverflowError, sqlite3.Error) as exc:
+        print(f"Label not recorded: {exc}", file=output)
+        return 2
+    finally:
+        if store is not None:
+            store.close()
 
 
 def run_current_state(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
@@ -670,6 +745,14 @@ def build_parser() -> argparse.ArgumentParser:
     recent.add_argument("--limit", type=int, default=20)
     recent.add_argument("--action", choices=("IGNORE", "REMEMBER", "WATCH", "INVESTIGATE", "ASK_CLOUD", "NOTIFY", "WOULD_NOTIFY"))
     recent.add_argument("--suppressed", action="store_true")
+    pending = sub.add_parser("pending-labels", help="list unlabeled shadow intervention opportunities")
+    pending.add_argument("--limit", type=int, default=20)
+    pending.add_argument("--all", dest="notify_only", action="store_false", help="include non-notify episodes too")
+    label_parser = sub.add_parser("label", help="attach a human truth label to an intervention episode")
+    label_parser.add_argument("episode_id", type=int, metavar="EPISODE_ID")
+    label_parser.add_argument("value", metavar="VALUE", help="useful, not-useful, needed-but-bad-timing, not-needed, or unsure")
+    label_parser.add_argument("--note", default="", help="optional short bounded note, no secrets")
+    labels = sub.add_parser("label-summary", help="show intervention label counts (evaluation-safe, no fabricated TP/FP)")
     interventions = sub.add_parser("recent-interventions", help="show recent bounded intervention episodes")
     interventions.add_argument("--limit", type=int, default=20)
     feedback = sub.add_parser("feedback", help="record explicit feedback for an intervention episode")
@@ -707,6 +790,12 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(run_recent_decisions(config, limit=args.limit, action=args.action, suppressed=args.suppressed))
     if args.command == "recent-interventions":
         raise SystemExit(run_recent_interventions(config, limit=args.limit))
+    if args.command == "pending-labels":
+        raise SystemExit(run_pending_labels(config, limit=args.limit, notify_only=args.notify_only))
+    if args.command == "label":
+        raise SystemExit(run_label_episode(config, args.episode_id, args.value, note=args.note))
+    if args.command == "label-summary":
+        raise SystemExit(run_label_summary(config))
     if args.command == "feedback":
         if args.episode_option is not None and (args.value_arg is not None or (args.value_option is not None and args.episode_id_arg is not None)):
             parser.error("feedback accepts one episode id and one value; do not mix duplicate positional and option values")

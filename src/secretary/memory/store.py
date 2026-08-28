@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from .intervention import (
+    InterventionLabel,
     InterventionOutcome,
     InterventionStatus,
     PreferenceKind,
     PreferenceSource,
     UserReaction,
     build_scope_key,
+    label_weight,
     normalize_feedback,
     parse_outcome,
     parse_reaction,
@@ -161,7 +163,9 @@ CREATE TABLE IF NOT EXISTS intervention_episodes (
     outcome TEXT NOT NULL DEFAULT 'UNKNOWN',
     explicit_feedback TEXT,
     preference_ids TEXT NOT NULL DEFAULT '[]',
-    learned_preference_id INTEGER
+    learned_preference_id INTEGER,
+    user_label TEXT,
+    labeled_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_intervention_episodes_time ON intervention_episodes(event_timestamp);
 CREATE INDEX IF NOT EXISTS idx_intervention_episodes_watch ON intervention_episodes(watch_id, status);
@@ -228,13 +232,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gui_trajectory_unique
 """
 
 
+RETENTION_CUTOFF_LABEL = "not_used"
+
+
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_LABEL_ALIASES = {
+    "USEFUL": "useful",
+    "NOT_USEFUL": "not-useful",
+    "NEEDED_BAD_TIMING": "needed-but-bad-timing",
+    "NOT_NEEDED": "not-needed",
+    "UNSURE": "unsure",
+}
+
+
 class MemoryStore:
     # Intervention tables and trace columns are an additive schema migration.
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(self, path: str | Path = "data/state.db") -> None:
         self.path = str(path)
@@ -264,6 +280,8 @@ class MemoryStore:
         self._ensure_column("feedback", "outcome", "TEXT")
         self._ensure_column("feedback", "note", "TEXT")
         self._ensure_column("intervention_episodes", "learned_preference_id", "INTEGER")
+        self._ensure_column("intervention_episodes", "user_label", "TEXT")
+        self._ensure_column("intervention_episodes", "labeled_at", "TEXT")
         self._migrate_privacy_labels()
         self.connection.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.connection.execute(
@@ -588,11 +606,17 @@ class MemoryStore:
 
         preference_id: int | None = None
         if instruction.preference is not None:
+            # Explicit labeling is the durable signal. Implicit observations
+            # (observed OPENED/DISMISSED/IGNORED) are weak evidence only and
+            # produce a low-confidence preference that cannot outrank the
+            # user's explicit voice or create a permanent negative rule.
+            weight = label_weight(instruction)
+            is_observed = instruction.reaction.is_weak
             preference_id = self.upsert_intervention_preference(
                 episode_id=int(episode_id),
                 preference=instruction.preference,
-                source=PreferenceSource.EXPLICIT_USER,
-                confidence=1.0,
+                source=PreferenceSource.OBSERVED_OUTCOME if is_observed else PreferenceSource.EXPLICIT_USER,
+                confidence=weight if is_observed else 1.0,
                 commit=False,
             )
             self.connection.execute(
@@ -713,6 +737,67 @@ class MemoryStore:
         if commit:
             self.connection.commit()
         return preference_id
+
+    def label_intervention_episode(self, episode_id: int, label, *, note: str = "") -> dict[str, object] | None:
+        """Attach a human shadow label to one unlabeled episode (evaluation only)."""
+        from .intervention import parse_label
+
+        episode = self.get_intervention_episode(episode_id)
+        if episode is None:
+            return None
+        if episode.get("user_label"):
+            return {"episode_id": episode_id, "already_labeled": str(episode["user_label"]), "updated": False}
+        safe_label = parse_label(label).value
+        self.connection.execute(
+            "UPDATE intervention_episodes SET user_label = ?, labeled_at = ? WHERE id = ?",
+            (_bounded(safe_label, 40, "UNSURE"), _utc_iso(), int(episode_id)),
+        )
+        if note.strip():
+            self.connection.execute(
+                "UPDATE intervention_episodes SET explicit_feedback = COALESCE(explicit_feedback, '') || ? WHERE id = ?",
+                (sanitize_semantic_label(f" [labeled: {safe_label}] {note}", 300), int(episode_id)),
+            )
+        self.connection.commit()
+        updated = self.get_intervention_episode(episode_id)
+        return {"episode_id": episode_id, "user_label": safe_label, "updated": True, "episode": updated}
+
+    def unlabeled_intervention_episodes(self, *, notify_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        """Episodes awaiting human shadow labeling.
+
+        ``notify_only`` focuses on real proposal opportunities
+        (WOULD_NOTIFY / NOTIFY / explicit reminder moments).
+        """
+        where = "user_label IS NULL AND labeled_at IS NULL"
+        if notify_only:
+            where += " AND (final_action IN ('WOULD_NOTIFY', 'NOTIFY') OR was_notified = 1)"
+        rows = self.connection.execute(
+            f"SELECT * FROM intervention_episodes WHERE {where} ORDER BY id DESC LIMIT ?",
+            (max(1, min(200, int(limit))),),
+        ).fetchall()
+        return [_decode_intervention_episode(dict(row)) for row in rows]
+
+    def labeled_intervention_episodes(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM intervention_episodes WHERE user_label IS NOT NULL ORDER BY labeled_at DESC, id DESC LIMIT ?",
+            (max(1, min(500, int(limit))),),
+        ).fetchall()
+        return [_decode_intervention_episode(dict(row)) for row in rows]
+
+    def intervention_label_summary(self) -> dict[str, Any]:
+        """Counts by label; never fabricates TP/FP without ground truth."""
+        rows = self.connection.execute(
+            "SELECT user_label, COUNT(*) AS count FROM intervention_episodes WHERE user_label IS NOT NULL GROUP BY user_label"
+        ).fetchall()
+        counts = {str(row["user_label"]): int(row["count"]) for row in rows}
+        unlabeled = self.connection.execute(
+            "SELECT COUNT(*) FROM intervention_episodes WHERE user_label IS NULL"
+        ).fetchone()[0]
+        return {
+            "labels": counts,
+            "labeled_total": sum(counts.values()),
+            "unlabeled_total": int(unlabeled),
+            "suggested_feedback": sorted({item.value for item in InterventionLabel}),
+        }
 
     def disable_intervention_preferences(
         self,

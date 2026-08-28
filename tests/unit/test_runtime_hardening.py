@@ -121,7 +121,7 @@ class RuntimeHardeningTests(unittest.TestCase):
             connection.close()
             store = MemoryStore(db)
             self.assertIn("status", {row[1] for row in store.connection.execute("PRAGMA table_info(sessions)")})
-            self.assertEqual(store.connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
+            self.assertEqual(store.connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "6")
             new_session = store.start_session()
             self.assertEqual(store.connection.execute("SELECT status FROM sessions WHERE id=1").fetchone()[0], "ABORTED")
             store.end_session(new_session, {"counters": {"raw_screenpipe_items": 2}})
