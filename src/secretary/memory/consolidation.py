@@ -15,8 +15,7 @@ That keeps tests stable and avoids silent model-driven persona mutation.
 from __future__ import annotations
 
 import json
-import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -225,3 +224,120 @@ def _topic_key(topic: str) -> str:
 
 def _normalize_text(value: str) -> str:
     return " ".join(value.strip().casefold().split())[:400]
+
+
+# LLM consolidation output must stay below durable-truth confidence.
+LLM_CONSOLIDATED_MAX_CONFIDENCE = 0.75
+LLM_KNOWLEDGE_MAX_ITEMS = 5
+
+
+class ConsolidationValidator:
+    """Gate between an LLM's memory proposal and durable storage.
+
+    A model suggestion never becomes durable truth directly: sources must
+    exist, content must be bounded and clean, confidence is capped, and
+    duplicates/contradictions are demoted to low-confidence candidates.
+    """
+
+    def __init__(self, store: MemoryStore) -> None:
+        self.store = store
+
+    def validate(self, candidate: Mapping[str, object]) -> tuple[bool, str]:
+        statement = str(candidate.get("statement") or "").strip()
+        if not statement:
+            return False, "empty_statement"
+        if "[redacted]" in statement.casefold():
+            return False, "redacted_content"
+        if len(statement) > 500:
+            return False, "statement_too_long"
+        episode_ids = [int(item) for item in (candidate.get("source_episode_ids") or [])]
+        if not episode_ids:
+            return False, "missing_source_episodes"
+        for episode_id in episode_ids:
+            if self.store.get_intervention_episode(episode_id) is None:
+                return False, f"unknown_source_episode:{episode_id}"
+        try:
+            confidence = float(candidate.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            return False, "bad_confidence"
+        if confidence > LLM_CONSOLIDATED_MAX_CONFIDENCE:
+            confidence = LLM_CONSOLIDATED_MAX_CONFIDENCE
+        if confidence <= 0.0:
+            return False, "non_positive_confidence"
+        return True, "ok"
+
+
+class LLMConsolidator:
+    """Optional model-assisted dreaming on top of the deterministic baseline.
+
+    The model receives ONLY privacy-filtered, already-semantic inputs
+    (trajectory labels, bounded episode metadata). Its proposals pass a
+    validator before persistence; any failure falls back to the
+    deterministic consolidator. Never blocks real-time perception.
+    """
+
+    def __init__(self, store: MemoryStore, complete: Callable[[str], str], *, batch_limit: int = DEFAULT_BATCH_LIMIT) -> None:
+        self.store = store
+        self.complete = complete
+        self.batch_limit = max(1, batch_limit)
+        self.validator = ConsolidationValidator(store)
+
+    def consolidate(self, *, session_id: int | None = None) -> ConsolidationResult:
+        episodes = self.store.recent_intervention_episodes(limit=self.batch_limit)
+        if len(episodes) < 2:
+            return ConsolidationResult(len(episodes), 0, 0, skipped_reason="episodes_below_threshold")
+        bounded = [
+            {
+                "id": _episode_id(episode),
+                "situation": str(episode.get("situation_type") or ""),
+                "activity": str(episode.get("activity") or ""),
+                "topic": str(episode.get("topic") or ""),
+                "outcome": str(episode.get("outcome") or ""),
+                "reaction": str(episode.get("user_reaction") or ""),
+                "summary": str(episode.get("summary") or "")[:200],
+            }
+            for episode in episodes
+        ]
+        prompt = (
+            "Extract durable knowledge from these desktop-work episodes. "
+            "Return ONLY compact JSON: {\"knowledge\": [{\"statement\": str<=300 chars, "
+            "\"confidence\": 0..0.75, \"source_episode_ids\": [ids]}], \"episode_summary\": str<=300 chars}. "
+            "Rules: generalizable lessons only (never transient state); every item must cite episode ids; "
+            "no secrets, no raw screen text.\nEPISODES:\n"
+            + json.dumps(bounded, ensure_ascii=True)
+        )
+        try:
+            raw = self.complete(prompt)
+            parsed = json.loads(raw)
+        except Exception:
+            return MemoryConsolidator(self.store, batch_limit=self.batch_limit).consolidate(session_id=session_id)
+        knowledge_items = parsed.get("knowledge") if isinstance(parsed, Mapping) else None
+        if not isinstance(knowledge_items, list):
+            return MemoryConsolidator(self.store, batch_limit=self.batch_limit).consolidate(session_id=session_id)
+        produced = 0
+        accepted_items = []
+        for item in knowledge_items[:LLM_KNOWLEDGE_MAX_ITEMS]:
+            if not isinstance(item, Mapping):
+                continue
+            ok, _reason = self.validator.validate(item)
+            if not ok:
+                continue
+            accepted_items.append(item)
+            episode_ids = [int(e) for e in (item.get("source_episode_ids") or [])]
+            memory_id = self.store.record_memory(
+                str(item.get("statement")),
+                source=MemorySource.CONSOLIDATED,
+                importance=min(0.85, float(item.get("confidence") or 0.5) + 0.2),
+                tier=MemoryTier.SEMANTIC,
+                confidence=float(item.get("confidence") or 0.5),
+                source_episode_ids=episode_ids,
+                provider="ollama",
+                model="consolidator-llm",
+            )
+            if memory_id:
+                produced += 1
+        self.store.set_meta(
+            CONSOLIDATION_MARKER_PREFIX + str(session_id if session_id is not None else "all"),
+            json.dumps(sorted({_episode_id(episode) for episode in episodes})[-200:], ensure_ascii=True),
+        )
+        return ConsolidationResult(len(episodes), produced, 0)

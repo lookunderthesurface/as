@@ -40,6 +40,7 @@ from .policy.proactive import Action, Decision, PolicyThresholds, ProactivePolic
 from .policy.watch import WatchManager
 from .privacy.filter import PrivacyFilter
 from .runtime import RuntimeCounters
+from .runtime_gpu import GPUStatusProvider
 from .vision.cognition import VisualCognition
 from .vision.mock_gui import MockGUIPerceptionProvider
 from .vision.ollama_gui import GUIPerceptionOllamaProvider
@@ -123,6 +124,8 @@ class SecretaryEngine:
         )
         self.extractor = EventExtractor(self.inference)
         self.cognition = self._build_visual_cognition()
+        self.gpu = GPUStatusProvider()
+        self._last_normalized_event: NormalizedEvent | None = None
         self.watch = WatchManager(self.config.watch_expiration_minutes, self.config.watch_max_active_hypotheses)
         self.hard_rules = HardRules(
             self.config.max_notifications_per_hour,
@@ -148,10 +151,21 @@ class SecretaryEngine:
         )
         self.logger = build_logger(self.config.log_directory)
 
-    def consolidate_memory(self) -> dict[str, object]:
+    def consolidate_memory(self, *, use_llm: bool = False) -> dict[str, object]:
         """Explicit, non-blocking consolidation trigger (deferred, safe)."""
-        from .memory.consolidation import MemoryConsolidator
+        from .memory.consolidation import LLMConsolidator, MemoryConsolidator
 
+        if use_llm:
+            gpu = self.gpu.snapshot()
+            from .runtime_gpu import GPUStatusProvider
+
+            if GPUStatusProvider.dreaming_allowed(gpu.status):
+                def _complete(prompt: str) -> str:
+                    request = InferenceRequest(current_event=self._last_normalized_event or _stub_event(), context_text=prompt)
+                    result = self.inference.analyze(request)
+                    return result.event.summary
+
+                return LLMConsolidator(self.store, _complete).consolidate().as_dict()
         return MemoryConsolidator(self.store).consolidate(session_id=self.session_id).as_dict()
 
     def close(self) -> None:
@@ -187,6 +201,24 @@ class SecretaryEngine:
             perception = MockGUIPerceptionProvider()
         return VisualCognition(perception, world=DesktopWorldState(), excluded_apps=self.config.excluded_apps)
 
+    @staticmethod
+    def _stub_event() -> NormalizedEvent:
+        """Minimal provider-neutral event for text-only consolidation calls."""
+        from datetime import datetime, timezone as _tz
+
+        return NormalizedEvent(
+            timestamp=datetime.now(_tz.utc),
+            source="consolidator",
+            foreground_app="secretary",
+            window_title="memory consolidation",
+            event_source="background",
+            text="",
+            text_source="internal",
+            focused=False,
+            screen_changed=False,
+            visual_required=False,
+        )
+
     def process(self, raw: dict[str, object]) -> ProcessResult:
         if self.session.paused:
             decision = Decision(Action.IGNORE, "paused", reason_code="PAUSED")
@@ -202,6 +234,7 @@ class SecretaryEngine:
             self.counters.increment("duplicate_events_dropped")
             return ProcessResult(Decision(Action.IGNORE, "duplicate capture frame", reason_code="DUPLICATE_DROPPED"))
         self.coalescer.add(event)
+        self._last_normalized_event = event
         gui_state_text, gui_trajectory_text = self._observe_gui_state(event)
         request = self.context_builder.build(
             event,
@@ -269,6 +302,7 @@ class SecretaryEngine:
             return results, None
         self.counters.increment("coalesced_batches")
         event = accepted[-1]
+        self._last_normalized_event = event
         gui_state_text, gui_trajectory_text = self._observe_gui_state(event)
         request = self.context_builder.build(
             event,
@@ -391,6 +425,12 @@ class SecretaryEngine:
         for the inference request. Never receives an excluded-app event.
         """
         update = self.cognition.on_accepted_event(event, event.timestamp, skip_vision=not event.image_path)
+        if not update.is_same:
+            # GPU-aware perception: under compute pressure widen the gaps.
+            gpu_snapshot = self.gpu.snapshot()
+            self.cognition.keyframes.forced_visual_interval_seconds = GPUStatusProvider.min_visual_interval_for(
+                gpu_snapshot.status, self.config.inference_vision_cooldown_seconds or 90.0
+            )
         if update.is_same:
             return self._gui_prompt_texts()
         if update.perception_failed:

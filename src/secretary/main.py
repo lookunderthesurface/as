@@ -106,16 +106,52 @@ def run_label_summary(config: SecretaryConfig | None = None, output=sys.stdout) 
         store.close()
 
 
-def run_consolidate(config: SecretaryConfig | None = None, output=sys.stdout) -> int:
+def run_consolidate(config: SecretaryConfig | None = None, output=sys.stdout, *, use_llm: bool = False) -> int:
     """Explicit background consolidation; never mutates source episodes."""
     config = config or SecretaryConfig.from_environment()
     store = MemoryStore(config.database_path)
     try:
-        from .memory.consolidation import MemoryConsolidator
+        from .memory.consolidation import LLMConsolidator, MemoryConsolidator
 
-        result = MemoryConsolidator(store).consolidate().as_dict()
+        if use_llm:
+            if config.inference_provider != "ollama":
+                print("LLM consolidation requires INFERENCE_PROVIDER=ollama; using deterministic consolidation.", file=output)
+                result = MemoryConsolidator(store).consolidate().as_dict()
+            else:
+                provider = OllamaInferenceProvider(
+                    base_url=config.ollama_base_url,
+                    text_model=config.ollama_text_model,
+                    vision_model=config.ollama_vision_model,
+                    timeout_seconds=config.ollama_timeout_seconds,
+                    keep_alive=config.ollama_keep_alive,
+                    temperature=config.ollama_temperature,
+                    think=config.ollama_think,
+                )
+
+                def _complete(prompt: str) -> str:
+                    from datetime import datetime as _dt, timezone as _tz
+
+                    from .events.schema import NormalizedEvent as _NE
+                    from .inference.schema import InferenceRequest as _IR
+
+                    stub = _NE(
+                        timestamp=_dt.now(_tz.utc), source="consolidator",
+                        foreground_app="secretary", window_title="memory consolidation",
+                        event_source="background", text="", text_source="internal",
+                        focused=False, screen_changed=False, visual_required=False,
+                    )
+                    outcome = provider.analyze(_IR(current_event=stub, context_text=prompt))
+                    return outcome.event.summary
+
+                result = LLMConsolidator(store, _complete).consolidate().as_dict()
+                if result.get("skipped_reason") is None and result.get("memories_produced", 0) == 0 and result.get("episodes_considered", 0) < 2:
+                    result = MemoryConsolidator(store).consolidate().as_dict()
+        else:
+            result = MemoryConsolidator(store).consolidate().as_dict()
         print("Ambient Secretary Memory Consolidation", file=output)
-        print(f"\nEpisodes considered: {result['episodes_considered']}", file=output)
+        mode = "llm+deterministic-fallback" if use_llm else "deterministic-v1"
+        print(f"\nMode: {mode}", file=output)
+        print(f"Episodes considered: {result['episodes_considered']}", file=output)
         print(f"Durable memories produced: {result['memories_produced']}", file=output)
         print(f"Superseded older equivalents: {result['superseded']}", file=output)
         if result.get("skipped_reason"):
@@ -323,12 +359,15 @@ def run_feedback(
     reaction: str | None = None,
     outcome: str | None = None,
     note: str = "",
+    timing: str | None = None,
+    content: str | None = None,
 ) -> int:
+    args_timing, args_content = timing, content
     if episode_id is None:
         print("Feedback requires an intervention episode id.", file=output)
         return 2
     if value is None or not value.strip():
-        value = "OBSERVED" if reaction or outcome else None
+        value = "OBSERVED" if (reaction or outcome or args_timing or args_content) else None
     if value is None:
         print("Feedback requires a value such as useful, dont-remind, more-proactive, or timing-bad.", file=output)
         return 2
@@ -342,6 +381,25 @@ def run_feedback(
             parse_reaction(reaction)
         if outcome is not None:
             parse_outcome(outcome)
+        if args_timing or args_content:
+            from .memory.intervention import normalize_content_feedback, normalize_timing_feedback
+
+            normalize_timing_feedback(args_timing)
+            normalize_content_feedback(args_content)
+            result = store.record_dimensional_feedback(
+                int(episode_id),
+                timing=args_timing,
+                content=args_content,
+                note=note,
+            )
+            print(f"Recorded dimensional feedback for episode #{result['episode_id']}.", file=output)
+            if result["timing"]:
+                print(f"  timing: {result['timing']}", file=output)
+            if result["content"]:
+                print(f"  content: {result['content']}", file=output)
+            for memory_id in result["knowledge_memory_ids"]:
+                print(f"  learned memory #{memory_id}", file=output)
+            return 0
         result = store.record_intervention_feedback(
             int(episode_id),
             value,
@@ -831,7 +889,8 @@ def build_parser() -> argparse.ArgumentParser:
     label_parser.add_argument("value", metavar="VALUE", help="useful, not-useful, needed-but-bad-timing, not-needed, or unsure")
     label_parser.add_argument("--note", default="", help="optional short bounded note, no secrets")
     labels =     sub.add_parser("label-summary", help="show intervention label counts (evaluation-safe, no fabricated TP/FP)")
-    sub.add_parser("consolidate", help="run one background memory consolidation (deferred, safe)")
+    consolidate = sub.add_parser("consolidate", help="run one background memory consolidation (deferred, safe)")
+    consolidate.add_argument("--llm", action="store_true", help="use the local text model with strict validation")
     sub.add_parser("memory-doctor", help="read-only memory hygiene diagnostics (dry run)")
     sub.add_parser("evaluate", help="intervention evaluation from human labels (safe: no fabricated TP/FP)")
     interventions = sub.add_parser("recent-interventions", help="show recent bounded intervention episodes")
@@ -843,6 +902,8 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--value", dest="value_option", action=_StoreOnce, help="useful, dont-remind, more-proactive, timing-bad, or forget")
     feedback.add_argument("--reaction", help="observed reaction such as opened, followed, or dismissed")
     feedback.add_argument("--outcome", help="observed outcome such as resolved, unresolved, or deferred")
+    feedback.add_argument("--timing", default=None, help="timing feedback: good, too-early, too-late, bad, silent")
+    feedback.add_argument("--content", default=None, help="content feedback: relevant, irrelevant, already-knew, wrong, useful, too-generic")
     feedback.add_argument("--note", default="", help="short bounded note; do not include secrets or raw screen content")
     sub.add_parser("profile", help="show the compact explainable secretary profile")
     state_parser = sub.add_parser("current-state", help="show the current sanitized semantic GUI state")
@@ -878,7 +939,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "label-summary":
         raise SystemExit(run_label_summary(config))
     if args.command == "consolidate":
-        raise SystemExit(run_consolidate(config))
+        raise SystemExit(run_consolidate(config, use_llm=args.llm))
     if args.command == "memory-doctor":
         raise SystemExit(run_memory_doctor(config))
     if args.command == "evaluate":
@@ -894,7 +955,7 @@ def main(argv: list[str] | None = None) -> None:
                 parser.error("feedback accepts either VALUE or --value, not both")
             episode_id = args.episode_id_arg
             value = args.value_option or args.value_arg
-        raise SystemExit(run_feedback(config, episode_id, value, reaction=args.reaction, outcome=args.outcome, note=args.note))
+        raise SystemExit(run_feedback(config, episode_id, value, reaction=args.reaction, outcome=args.outcome, note=args.note, timing=args.timing, content=args.content))
     if args.command == "profile":
         raise SystemExit(run_secretary_profile(config))
     if args.command == "current-state":
