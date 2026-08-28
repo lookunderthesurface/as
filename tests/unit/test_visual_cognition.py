@@ -411,10 +411,12 @@ class DiagnosisCLITests(unittest.TestCase):
                 database_path=root / "data" / "state.db",
                 log_directory=root / "logs",
             )
+            # Anchor near real wall-clock time so the --last window filter is stable.
+            recent = datetime.now(timezone.utc) - timedelta(minutes=1)
             store = MemoryStore(config.database_path)
             store.record_gui_state(
                 session_id=None,
-                event_timestamp=NOW,
+                event_timestamp=recent,
                 application="VSCode",
                 window="attention.py",
                 activity="debugging",
@@ -432,7 +434,7 @@ class DiagnosisCLITests(unittest.TestCase):
             )
             store.record_gui_trajectory_event(
                 session_id=None,
-                event_timestamp=NOW,
+                event_timestamp=recent,
                 label="debugging: stalled",
                 activity="debugging",
                 application="WindowsTerminal.exe",
